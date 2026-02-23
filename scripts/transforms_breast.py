@@ -213,14 +213,11 @@ def define_vae_transform(
     if is_train:
         train_crop = [
             SpatialPadd(keys=keys, spatial_size=patch_size, allow_missing_keys=True),
-            RandCropByPosNegLabeld(
-                keys=keys, 
-                label_key="label",
-                spatial_size=patch_size, 
-                pos=1,
-                neg=1,
-                num_samples=1,
-                allow_missing_keys=True
+            RandSpatialCropd(
+                keys=keys,
+                roi_size=patch_size,
+                random_center=True,
+                random_size=False
             ),
         ]
     else:
