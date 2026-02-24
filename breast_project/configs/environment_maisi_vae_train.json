@@ -1,7 +1,0 @@
-{
-    "model_dir": "breast_project/models/",
-    "tfevent_path": "breast_project/outputs/tfevent",
-    "trained_autoencoder_path": "breast_project/weights/autoencoder_v2.pt",
-    "dataset_json": "breast_project/data/vae_dataset.json",
-    "finetune": true
-}
