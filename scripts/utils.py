@@ -26,7 +26,10 @@ import monai
 from monai.bundle import ConfigParser
 from monai.config import DtypeLike, NdarrayOrTensor
 from monai.data import CacheDataset, DataLoader, partition_dataset
-from monai.transforms import Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd
+from monai.transforms import (
+    Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd,
+    RandGaussianNoise, RandAdjustContrastd
+)
 from monai.transforms.utils_morphological_ops import dilate, erode
 from monai.utils import TransformBackends, convert_data_type, convert_to_dst_type, get_equivalent_dtype
 from scipy import stats
@@ -231,11 +234,13 @@ def define_instance(args: Namespace, instance_def_key: str) -> Any:
 
 def add_data_dir2path(list_files: list, data_dir: str, fold: int = None) -> tuple[list, list]:
     """
-    Read a list of data dictionary.
+    Read a list of data dictionary and prepend data_dir to file paths.
+
+    Handles both standard format (image, label) and triplet format (sub, pre, mask).
 
     Args:
         list_files (list): input data to load and transform to generate dataset for model.
-        data_dir (str): directory of files.
+        data_dir (str): directory of files (can be comma-separated for multiple dirs).
         fold (int, optional): fold index for cross validation. Defaults to None.
 
     Returns:
@@ -245,11 +250,31 @@ def add_data_dir2path(list_files: list, data_dir: str, fold: int = None) -> tupl
     if fold is not None:
         new_list_files_train = []
         new_list_files_val = []
-    for d in new_list_files:
-        d["image"] = os.path.join(data_dir, d["image"])
 
-        if "label" in d:
-            d["label"] = os.path.join(data_dir, d["label"])
+    # Handle multiple data directories (comma-separated)
+    data_dirs = data_dir.split(",") if isinstance(data_dir, str) else [data_dir]
+
+    for d in new_list_files:
+        # Check for triplet format (contains "sub" key)
+        if "sub" in d:
+            # Triplet format: map sub->image, pre->pre, mask->label
+            # For cached data, paths may already include directory prefix
+            if not os.path.isabs(d["sub"]):
+                d["image"] = d["sub"]  # sub becomes the main "image" (latent)
+            else:
+                d["image"] = d["sub"]
+
+            if "pre" in d:
+                d["pre"] = d["pre"] if os.path.isabs(d["pre"]) else d["pre"]
+
+            if "mask" in d:
+                d["label"] = d["mask"]  # mask becomes "label" for loss weighting
+        else:
+            # Standard format
+            d["image"] = os.path.join(data_dirs[0], d["image"])
+
+            if "label" in d:
+                d["label"] = os.path.join(data_dirs[0], d["label"])
 
         if fold is not None:
             if d["fold"] == fold:
@@ -295,30 +320,90 @@ def prepare_maisi_controlnet_json_dataloader(
         list_valid = []
         for data_list, data_root in zip(json_data_list, data_base_dir):
             with open(data_list, "r") as f:
-                json_data = json.load(f)["training"]
-            train, val = add_data_dir2path(json_data, data_root, fold)
+                json_root = json.load(f)
+            # Check if JSON has explicit "validation" key (cached dataset format)
+            if "validation" in json_root and len(json_root["validation"]) > 0:
+                # Cached dataset: use explicit training/validation splits
+                train_data = json_root["training"]
+                val_data = json_root["validation"]
+                # For cached data, paths are already absolute, no need to add data_root
+                # Just convert to list format
+                train = train_data
+                val = val_data
+            else:
+                # Original format: use fold-based splitting
+                json_data = json_root["training"]
+                train, val = add_data_dir2path(json_data, data_root, fold)
             list_train += train
             list_valid += val
     else:
         with open(json_data_list, "r") as f:
-            json_data = json.load(f)["training"]
-        list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
+            json_root = json.load(f)
+        # Check if JSON has explicit "validation" key (cached dataset format)
+        if "validation" in json_root and len(json_root["validation"]) > 0:
+            # Cached dataset: use explicit training/validation splits
+            train = json_root["training"]
+            val = json_root["validation"]
+            # Skip add_data_dir2path since paths are already absolute
+            list_train, list_valid = train, val
+        else:
+            # Original format: use fold-based splitting
+            json_data = json_root["training"]
+            list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
 
-    common_transform = [
-        LoadImaged(keys=["image", "label"], image_only=True, ensure_channel_first=True),
-        Orientationd(keys=["label"], axcodes="RAS"),
-        EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
-        Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
-        Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
-        Lambdad(keys="spacing", func=lambda x: torch.FloatTensor(x)),
-        Lambdad(
-            keys=["top_region_index", "bottom_region_index", "spacing"], func=lambda x: x * 1e2, allow_missing_keys=True
-        ),
-        Lambdad(
-            keys=["modality"], func=lambda x: modality_mapping[x], allow_missing_keys=True
-        ),
-        EnsureTyped(keys=['modality'], dtype=torch.long, allow_missing_keys=True),
-    ]
+    # Detect if using triplet format (has "pre" key in first sample)
+    use_triplet_format = len(list_train) > 0 and "pre" in list_train[0]
+
+    if use_triplet_format:
+        # Triplet format: load pre (conditioning), image (sub_emb), and label (mask)
+        # Note: All samples are cached at fixed 256³ (Plan B: mask-anchored cropping)
+        # Intensity augmentation: ONLY applied to pre images (conditioning signal)
+        # Simulates: (1) instrument thermal noise, (2) inter-hospital imaging style variations
+        common_transform = [
+            LoadImaged(keys=["pre", "image", "label"], image_only=True, ensure_channel_first=True),
+            Orientationd(keys=["pre", "label"], axcodes="RAS"),
+            EnsureTyped(keys=["pre"], dtype=torch.float32, track_meta=False),
+            EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
+            # Intensity augmentations for pre images only
+            RandGaussianNoise(
+                keys=["pre"],
+                prob=0.15,           # Conservative probability
+                mean=0.0,
+                std=0.01,            # Minimal intensity: 1% signal fluctuation (instrument thermal noise)
+            ),
+            RandAdjustContrastd(
+                keys=["pre"],
+                prob=0.2,            # Moderate probability
+                gamma=(0.9, 1.1),    # ±10% contrast range (inter-hospital imaging style variations)
+            ),
+            Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
+            Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
+            Lambdad(keys="spacing", func=lambda x: torch.FloatTensor(x)),
+            Lambdad(
+                keys=["top_region_index", "bottom_region_index", "spacing"], func=lambda x: x * 1e2, allow_missing_keys=True
+            ),
+            Lambdad(
+                keys=["modality"], func=lambda x: modality_mapping[x], allow_missing_keys=True
+            ),
+            EnsureTyped(keys=['modality'], dtype=torch.long, allow_missing_keys=True),
+        ]
+    else:
+        # Standard format: image and label only
+        common_transform = [
+            LoadImaged(keys=["image", "label"], image_only=True, ensure_channel_first=True),
+            Orientationd(keys=["label"], axcodes="RAS"),
+            EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
+            Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
+            Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
+            Lambdad(keys="spacing", func=lambda x: torch.FloatTensor(x)),
+            Lambdad(
+                keys=["top_region_index", "bottom_region_index", "spacing"], func=lambda x: x * 1e2, allow_missing_keys=True
+            ),
+            Lambdad(
+                keys=["modality"], func=lambda x: modality_mapping[x], allow_missing_keys=True
+            ),
+            EnsureTyped(keys=['modality'], dtype=torch.long, allow_missing_keys=True),
+        ]
     train_transforms, val_transforms = Compose(common_transform), Compose(common_transform)
 
     train_loader = None

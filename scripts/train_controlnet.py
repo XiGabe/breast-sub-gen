@@ -120,6 +120,7 @@ def compute_model_output(
     modality_tensor=None,
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
+    pre_images=None,
     return_controlnet_blocks=False
 ):
     """
@@ -127,7 +128,7 @@ def compute_model_output(
     the ControlNet intermediate blocks) for a given noisy latent and conditions.
 
     Pipeline:
-      1) Binarize labels to build ControlNet condition.
+      1) Build ControlNet condition (from labels or pre_images).
       2) Add noise to `images` at `timesteps` via the scheduler.
       3) Pass noisy latent and conditions to ControlNet to get down/mid features.
       4) Pass everything to U-Net (with spacing, optional modality & body-region
@@ -137,7 +138,7 @@ def compute_model_output(
         images (torch.Tensor):
             Input latent/image tensor to be noised. Shape [B, C, X, Y, Z].
         labels (torch.Tensor or monai.data.MetaTensor):
-            Segmentation labels used to create ControlNet condition.
+            Segmentation labels used to create ControlNet condition (if pre_images is None).
         noise (torch.Tensor):
             Noise tensor aligned with `images`.
         timesteps (torch.Tensor or Any):
@@ -156,6 +157,9 @@ def compute_model_output(
             Region index tensor (top bound) for body-region-aware conditioning.
         bottom_region_index_tensor (torch.Tensor, optional):
             Region index tensor (bottom bound) for body-region-aware conditioning.
+        pre_images (torch.Tensor, optional):
+            Pre-contrast images used as ControlNet condition. If provided, takes
+            priority over labels. Shape [B, 1, X, Y, Z] at physical resolution.
         return_controlnet_blocks (bool, optional):
             If True, also return `(down_block_res_samples, mid_block_res_sample)`.
             Defaults to False.
@@ -170,8 +174,22 @@ def compute_model_output(
     include_modality = ( modality_tensor is not None )
     include_body_region = ( top_region_index_tensor is not None) and (bottom_region_index_tensor is not None)
 
-    # use binary encoding to encode segmentation mask
-    controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+    # Build controlnet condition: use pre_images if provided, otherwise binarize labels
+    if pre_images is not None:
+        # Use pre-contrast images as conditioning (single channel)
+        # Pre images are at physical resolution (256³), need to interpolate to latent space (64³)
+        controlnet_cond = F.interpolate(
+            pre_images.float(),
+            size=images.shape[2:],
+            mode='trilinear',
+            align_corners=False
+        )
+        # Ensure single channel input
+        if controlnet_cond.shape[1] != 1:
+            controlnet_cond = controlnet_cond[:, :1, ...]
+    else:
+        # Fallback to original behavior: binary encoding of segmentation mask
+        controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
 
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
@@ -362,6 +380,12 @@ def train_controlnet(
             labels = batch["label"].to(device)
             if labels.shape[1] != 1:
                 raise ValueError(f"We expect labels with shape [B,1,X,Y,Z], yet got {labels.shape}")
+
+            # Get pre images for controlnet conditioning (if available)
+            pre_images = batch.get("pre", None)
+            if pre_images is not None:
+                pre_images = pre_images.to(device)
+
             # get corresponding conditions
             spacing_tensor = batch["spacing"].to(device)
             top_region_index_tensor = None
@@ -391,8 +415,8 @@ def train_controlnet(
                         0, noise_scheduler.num_train_timesteps, (images.shape[0],), device=images.device
                     ).long()
                 (
-                    model_output, 
-                    model_block1_output, 
+                    model_output,
+                    model_block1_output,
                     model_block2_output
                 ) = compute_model_output(
                     images,labels,noise,timesteps,noise_scheduler,
@@ -401,6 +425,7 @@ def train_controlnet(
                     modality_tensor,
                     top_region_index_tensor,
                     bottom_region_index_tensor,
+                    pre_images=pre_images,  # Pass pre images as conditioning
                     return_controlnet_blocks=False
                 )
                 if args.use_region_contrasive_loss:
@@ -415,6 +440,7 @@ def train_controlnet(
                         modality_tensor,
                         top_region_index_tensor,
                         bottom_region_index_tensor,
+                        pre_images=pre_images,  # Pass pre images as conditioning
                         return_controlnet_blocks=False
                     )
                 

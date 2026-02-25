@@ -1,9 +1,9 @@
 {
-    "data_base_dir": "./step_4",
+    "data_base_dir": "./embeddings_breast_sub",
     "embedding_base_dir": "./embeddings_breast_sub",
     "pre_output_dir": "./processed_pre",
     "mask_output_dir": "./processed_mask",
-    "json_data_list": "./dataset_breast.json",
+    "json_data_list": "./dataset_breast_cached.json",
     "model_dir": "./weights",
     "model_filename": "diff_unet_3d_breast_sub.pt",
     "output_dir": "./output_breast_sub",
@@ -11,5 +11,8 @@
     "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
     "existing_ckpt_filepath": "",
     "modality_mapping_path": "./configs/modality_mapping.json",
+    "tf_event_path": "./tensorboard_logs",
+    "exp_name": "breast_sub_controlnet",
+    "trained_diffusion_path": "./weights/diffusion_model_breast_sub.pt",
     "modality": "mri"
 }

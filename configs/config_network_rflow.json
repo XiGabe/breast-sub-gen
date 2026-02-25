@@ -82,8 +82,8 @@
         ],
         "num_res_blocks": 2,
         "use_flash_attention": true,
-        "conditioning_embedding_in_channels": 8,
-        "conditioning_embedding_num_channels": [8, 32, 64],
+        "conditioning_embedding_in_channels": 1,
+        "conditioning_embedding_num_channels": [16, 32, 64],
         "num_class_embeds": 128,
         "resblock_updown": true,
         "include_fc": true
