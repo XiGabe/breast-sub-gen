@@ -16,8 +16,6 @@ dist/
 *.ckpt
 *.h5
 # 显式忽略你的权重文件夹
-breast_project/weights/
-breast_project/models/
 # 忽略 MAISI 官方下载的权重
 models/*.pt
 
@@ -25,17 +23,10 @@ models/*.pt
 # 忽略所有 NIfTI 图像数据
 *.nii
 *.nii.gz
-# 忽略本地解压的数据集目录
-step_4/
-/content/step_4/
-# 忽略任何 tar 分卷
 *.tar.a*
-
-# --- 4. 训练日志与可视化 ---
-# 忽略 TensorBoard 日志
-breast_project/outputs/
-outputs/
-tfevent*
+# 忽略可视化输出
+vae_vis_output/
+embeddings*/
 
 # --- 5. 系统与 IDE 文件 ---
 .DS_Store
@@ -43,7 +34,7 @@ tfevent*
 .vscode/
 .idea/
 *.log
-
+*.csv
 # --- 6. 配置文件例外 (可选) ---
 # 如果你有包含私密 Token 的 JSON，可以加在这里
 # 但是你的 config_maisi_vae_train.json 通常是需要同步的，所以不忽略

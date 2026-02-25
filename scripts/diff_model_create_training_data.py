@@ -31,12 +31,14 @@ from .transforms import define_fixed_intensity_transform, SUPPORT_MODALITIES
 from .utils import define_instance, dynamic_infer
 
 
-def create_transforms(dim: tuple = None, modality: str = 'unknown') -> Compose:
+def create_transforms(dim: tuple = None, modality: str = 'unknown', skip_intensity: bool = False) -> Compose:
     """
     Create a set of MONAI transforms for preprocessing.
 
     Args:
         dim (tuple, optional): New dimensions for resizing. Defaults to None.
+        modality (str, optional): Imaging modality. Defaults to 'unknown'.
+        skip_intensity (bool, optional): Skip intensity transforms for preprocessed data. Defaults to False.
 
     Returns:
         Compose: Composed MONAI transforms.
@@ -45,12 +47,15 @@ def create_transforms(dim: tuple = None, modality: str = 'unknown') -> Compose:
         modality = 'mri'
     if 'ct' in modality:
         modality = 'ct'
-    
-    if modality in SUPPORT_MODALITIES:        
-        intensity_transforms = define_fixed_intensity_transform(modality=modality)        
+
+    # Skip intensity transforms for already preprocessed data
+    if skip_intensity:
+        intensity_transforms = []
+    elif modality in SUPPORT_MODALITIES:
+        intensity_transforms = define_fixed_intensity_transform(modality=modality)
     else:
         intensity_transforms = []
-    
+
     if dim:
         return Compose(
             [
@@ -168,6 +173,10 @@ def process_file(
             # Move preprocessed volume to device, add batch and channel dims -> [1,1,X,Y,Z]
             pt_nda = torch.from_numpy(nda_image).float().to(device).unsqueeze(0).unsqueeze(0)
 
+            # IMPORTANT: MAISI VAE expects [-1, 1] input range, but our data is [0, 1]
+            # Convert [0, 1] -> [-1, 1] before encoding
+            pt_nda = pt_nda * 2.0 - 1.0
+
             # Forward through autoencoder's stage-2 encoder to get latent z.
             inferer = SlidingWindowInferer(
                 roi_size=[320, 320, 160],
@@ -252,10 +261,10 @@ def diff_model_create_training_data(
         )
 
         # Build the transform pipeline that includes resizing to new_dim.
-        # NOTE: 'modality' is referenced here but not defined in this scope; caller must ensure it's available
-        # (or this line will raise a NameError). Left unchanged by request.
+        # NOTE: Data in step_4/ is already preprocessed (clipped + normalized to [0,1])
+        # so we skip intensity transforms to avoid redundant processing.
         logger.info(f"Generate embddings assuming the data is {modality}")
-        new_transforms = create_transforms(new_dim, modality)
+        new_transforms = create_transforms(new_dim, modality, skip_intensity=True)
 
         # Run the per-file preprocessing + autoencoder encoding + NIfTI saving.
         process_file(filepath, args, autoencoder, device, plain_transforms, new_transforms, logger)
