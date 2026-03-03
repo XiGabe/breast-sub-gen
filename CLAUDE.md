@@ -1,512 +1,514 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# CLAUDE.md - Breast Subtraction Synthesis Project
 
 ## Project Overview
 
-This is a 3D Contrast-Enhanced Breast MRI Synthesis project using MAISI (Medical AI for Synthetic Imaging) framework on the MAMA-MIA Dataset. The goal is to generate synthetic 3D post-contrast breast MRI from pre-contrast inputs using diffusion models.
+3D Contrast-Enhanced Breast MRI Synthesis using MAISI framework. Generate synthetic post-contrast MRI from pre-contrast inputs.
 
-**Core Innovation**: Unlike prior 2D slice-wise DDPM approaches (e.g., Ibarra et al. 2025), this project uses a fully 3D framework to preserve volumetric spatial consistency for accurate tumor localization.
+**Method**: `Pre-contrast → Model → 3D Subtraction Map → Post = Pre + Sub`
 
-**Method**: `Pre-contrast MRI → Model → 3D Subtraction Map → Post = Pre + Predicted_Sub`
+## Data Structure (`step_4/`)
 
-## Data Structure
+- **Files**: `{UUID}_{side}_{pre|sub|mask}.nii.gz`
+- **Spacing**: `[0.7, 0.7, 1.2]` mm³ (Z,Y,X), RAS orientation
+- **Metadata**: `step_4_metadata.csv` with `Is_Flipped`, `Crop_BBox`, `Orig_Shape`
+- **Note**: Right-side breasts are flipped to left (`Is_Flipped=1`)
 
-### Preprocessed Data (`step_4/`)
-
-All preprocessed breast MRI data resides in `step_4/` with standardized RAS orientation and isotropic resampling to `[0.7, 0.7, 1.2] mm³`.
-
-**File Naming Convention**:
-- `{UUID}_{side}_pre.nii.gz` - Pre-contrast (condition input)
-- `{UUID}_{side}_sub.nii.gz` - Subtraction map (target, sparse signal)
-- `{UUID}_{side}_mask.nii.gz` - Tumor segmentation mask
-
-**Metadata**: `step_4/step_4_metadata.csv` contains all information needed to map back to patient physical space:
-- `UUID`: Database primary key
-- `Original_ID`: Source patient identifier
-- `Side`: Original breast side (`L` or `R`)
-- `Is_Flipped`: Whether right-side data was flipped (0 or 1) - **must reverse during inference**
-- `Crop_BBox`: `[x, y, z, w, h, d]` bounding box for reconstruction
-- `Orig_Shape`: Original full-volume dimensions
-- `Has_Tumor`: Binary flag for tumor presence (0 or 1)
-
-**Critical**: All right-side breasts have been horizontally flipped to appear as left breasts (`Is_Flipped=1`). This standardization reduces model learning complexity.
-
-## Code Architecture
-
-### MAISI Framework Structure
-
-The codebase extends MAISI-v2 (MONAI-based) for breast-specific synthesis:
+## Cached Dataset
 
 ```
-scripts/
-├── diff_model_train.py          # Diffusion model training (DiT backbone)
-├── train_controlnet.py          # ControlNet training with region-aware losses
-├── diff_model_infer.py          # Inference with CFG support
-├── infer_controlnet.py          # ControlNet-specific inference
-├── sample.py                    # Core sampling logic (LDMSampler class)
-├── utils.py                     # Utilities (transforms, masking, post-processing)
-├── augmentation.py              # Data augmentation (tumor-specific transforms)
-├── diff_model_setting.py        # Distributed training setup and config loading
-├── find_masks.py                # Database query for candidate masks
-├── quality_check.py             Statistical quality control (outlier detection)
-└── transforms.py                # VAE transform pipelines for CT/MRI
-
-configs/
-├── environment_*.json           # Paths (data, models, outputs)
-├── config_infer*.json           # Inference parameters
-├── config_network_*.json        # Network architecture definitions
-├── modality_mapping.json        # Modality label mappings
-└── label_dict*.json             # Anatomy label dictionaries
+embeddings_breast_sub/     # Sub_emb (64³, 4ch) - VAE encoded
+processed_pre/             # Pre_aligned (256³, 1ch) - controlnet condition
+processed_mask/            # Mask_aligned (256³, 1ch) - loss weighting
+dataset_breast_cached.json # Train/Val split (1553/390 samples)
 ```
 
-### Training Pipeline Architecture
+## Training Pipeline
 
+### Current Status (2026-02-27)
+
+| Stage | Epochs | Unfrozen | Loss | Status |
+|-------|--------|----------|------|--------|
+| Stage 1 | 58-70 | up_blocks.2,3 | 0.86 | ✅ Complete |
+| Stage 2 | 71-100 | +middle, up1 | 0.86 | ✅ Complete |
+| Stage 2.5 | 101-107 | middle, up1, up2, up3 | Top-K | ✅ Complete |
+| **Stage 3 (Failed)** | **108-130** | **ALL up + middle** | **Top-K + Std** | **❌ Background white** |
+| **Stage 3 (Attempt 1)** | **108-111** | **ALL up + middle** | **Asymmetric Contrast** | **❌ Signal scattered** |
+| **Stage 3 (Current)** | **108-130** | **ALL up + middle** | **MSE Contrast** | **🔄 Training** |
+
+**Stage 2.5 Results** (Top-K Loss):
+- Val Loss: 0.8526 (best at epoch 101)
+- Inference: Tumor signal ~89% of GT intensity
+- Background: Pure black ✅
+- Issue: Tumor signal slightly weak, boundaries blurry
+
+**Stage 3 (Failed) Analysis**:
+- **Problem**: Background turned completely white (MAE 0.83, Pred mean 0.88)
+- **Root Cause**: Top-K (30%) ignored 70% of background pixels + up_blocks.0 unfrozen = no constraint on background
+- **up_blocks.0** (80M params) controls global image style but had NO loss constraint in background regions
+- Std Loss only constrained variance, not mean intensity
+
+**Stage 3 (Attempt 1) - ROI Intensity + Asymmetric Contrast**:
+- **Problem**: Asymmetric contrast allowed model to "cheat" by spreading signal thinly
+- **Root Cause**: `F.relu(gt-pred).mean()` only penalizes under-estimation, model satisfies it with many weak pixels
+- **Result**: Pred mean 0.003 vs GT 0.048 (only 6%!), pixels > 0.1: 1.36% vs 12.4%
+- **Status**: ❌ Signal extremely scattered, predictions nearly black
+
+**Stage 3 (Current) - ROI Intensity + MSE Contrast Loss**:
+- **Strategy**: Global L1 (10× tumor weight) + ROI Intensity + **MSE Contrast**
+- **Global L1** (dominant): Background × 1.0 + Tumor × 10.0 → forces correct spatial distribution
+- **ROI Intensity**: `|mean(pred_roi) - mean(gt_roi)|` → ensures overall brightness
+- **MSE Contrast** (killer feature): `F.mse_loss(pred_roi, gt_roi)` → **squared penalty on outliers!**
+  - Gradient: 2×(pred-gt) → stronger correction for large errors
+  - Prevents model from "cheating" by spreading high signal into many weak pixels
+  - If GT=1.0, Pred=0.1 → MSE gradient=-1.8 vs L1 gradient=-1.0
+- **Unfreeze**: ALL up_blocks + middle_block (150M+ params)
+- **Weights**: `weighted_loss=10.0`, `roi_intensity_weight=0.5`, `mse_weight=0.1`
+- **Loss Balance**: Global L1 ~90%, ROI ~10%
+- **Training Loss**: ~1.07 (stable)
+
+### Key Implementation Details
+
+**Stage 3 Failed Loss** (Top-K + Std Matching):
+```python
+# Top-K Loss: Focus on hardest 30% pixels ONLY
+# Problem: Ignores 70% of pixels (mostly background!)
+l1_loss_raw = F.l1_loss(pred, gt, reduction="none") * weights
+l1_loss_flat = l1_loss_raw.view(B, -1)
+k = int(l1_loss_flat.size(1) * 0.3)
+topk_loss, _ = torch.topk(l1_loss_flat, k, dim=1)
+loss_topk = topk_loss.mean()
+
+# Std Matching Loss: Force overall contrast
+# Problem: Only constrains variance, not mean intensity
+std_pred = torch.std(model_output.float(), dim=[1, 2, 3, 4])
+std_gt = torch.std(model_gt.float(), dim=[1, 2, 3, 4])
+loss_std = F.l1_loss(std_pred, std_gt)
+
+# Combined: up_blocks.0 has NO constraint on background → background turns white
+loss = loss_topk + 1.0 * loss_std
 ```
-Caching Stage (offline):
-Input (variable)                Output (fixed)
-─────────────────────────────────────────────────────
-Pre (1ch)  ──┐
-             ├──> Normalize to 256³ ──> Pre_aligned (256³, 1ch)
-Mask (1ch) ──┤  (pad < 256, crop > 256)
-             │
-Sub (1ch)  ──┘   ──> Normalize to 256³ ──> VAE ──> Sub_emb (64³, 4ch)
 
-Training Stage:
-Input (256³)                    Latent Space (64³)
-─────────────────────────────────────────────────────
-Pre_aligned (1ch) → Interpolate → Cond. Embedding → Condition Features
-                                              ↓
-Sub_emb (4ch) ──────────────────────────────→ Target Latent
-                                              ↓
-                                     [Diffusion Training]
-                                              ↓
-                           [ControlNet] → [DiT/U-Net] → Predicted Velocity
-                                 ↓              ↓
-                         (trainable)      (frozen backbone)
+**Stage 3 Final Loss** (Global L1 + ROI Intensity + MSE Contrast):
+```python
+# 1. Global Weighted L1 Loss (ALL pixels constrained!)
+l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
+loss_global = (l1_loss_raw * weights).mean()
+# weights: background × 1.0, tumor × 10.0
+# Effect: Dominant spatial constraint, prevents signal scattering
+
+# 2. ROI Intensity + MSE Contrast Loss
+roi_mask = (interpolate_label > 0.5)
+if roi_mask.sum() > 0:
+    roi_mask_expanded = roi_mask.repeat(1, images.shape[1], 1, 1, 1)
+    pred_roi = model_output.float()[roi_mask_expanded]
+    gt_roi = model_gt.float()[roi_mask_expanded]
+
+    # 2a. Mean intensity constraint (macro-level)
+    # Keep L1 for stable gradient on global brightness
+    loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+
+    # 2b. MSE Contrast Loss - squared penalty on spatial distribution!
+    # MSE heavily penalizes large errors with stronger gradients
+    # Gradient = 2*(pred-gt), forces model to rebuild high peaks
+    # Prevents "cheating" by spreading signal into many weak pixels
+    loss_contrast = F.mse_loss(pred_roi, gt_roi)
+
+    # Combined ROI loss (MSE gradients are strong, use low weight)
+    loss_roi_total = loss_intensity + 0.1 * loss_contrast
+else:
+    loss_roi_total = torch.tensor(0.0, device=model_output.device)
+
+# 3. Final Combined Loss
+# roi_intensity_weight=0.5 + weighted_loss=10.0 gives: Global L1 ~90%, ROI ~10%
+loss = loss_global + 0.5 * loss_roi_total
 ```
 
-### Key Design Decisions
+**Why MSE Works:**
+- **MSE Gradient = 2×(pred-gt)**: For large errors (GT=1.0, Pred=0.1), gradient is -1.8 vs L1's -1.0
+- **Squared Penalty**: (1.0-0.1)² = 0.81 vs L1 = 0.9, but gradient is 80% stronger!
+- **Spatial Distribution**: MSE forces pixel-level matching, not just mean matching
+- **Global L1 (10× tumor)**: Dominant constraint ensures correct spatial pattern + pure black background
+- **Result**: Model must rebuild high-intensity peaks, cannot "spread thinly"
 
-1. **Asymmetric Latent Caching**: Only subtraction maps are encoded through VAE to 64³ latent space. Pre-contrast and mask stay at 256³ physical resolution.
+**Dilated Mask Loss** (kernel_size=5): Compensates VAE receptive field edge effects
 
-2. **Fixed 256³ Spatial Size (Plan B)**: All samples normalized to exactly 256³ during offline caching:
-   - Dimensions < 256: **symmetric padding** with zeros
-   - Dimensions > 256: **mask-anchored cropping** (preserves tumor centroid)
-   - No dynamic cropping needed during training (simplifies pipeline)
-   - Rationale: Only ~10% of samples exceed 256³ in any dimension
+**Gradient Checkpointing**: Enabled in Stage 3 to save memory at cost of computation time
 
-3. **Mask-Weighted Loss**: Tumor regions are downsampled to latent space then dilated to compensate for VAE receptive field edge effects. Weight map: background=1.0, tumor=5.0.
+**Conditioning Embedding**: 3 strided convolutions (256³ → 128³ → 64³), learns features during downsampling
 
-4. **Pre as ControlNet Condition**: Pre-contrast images (256³) are used directly as conditioning, not binary labels. During training, they are trilinearly interpolated to latent space.
-
-5. **Intensity Augmentation (Pre Images Only)**: Minimal intensity augmentations applied during training to simulate real-world imaging variations:
-   - **RandGaussianNoise**: prob=0.15, std=0.01 (instrument thermal noise)
-   - **RandAdjustContrastd**: prob=0.2, gamma∈[0.9, 1.1] (inter-hospital style variations)
-   - Applied ONLY to `pre` images, NOT to Sub_emb or Mask
-   - Preserves spatial alignment (no spatial augmentations)
-
-6. **Frozen Backbone Training**: Only ControlNet and Conditioning Embedding are trainable. DiT/U-Net backbone remains frozen to preserve medical imaging priors.
+**VAE Output Inversion**: Apply `1.0 - output` after VAE decode (inherent MAISI VAE property)
 
 ## Common Commands
 
-### VAE Safety Testing
-
-Before training, validate VAE handles sparse subtraction maps correctly:
-
+### Training
 ```bash
-# Test encode-decode quality with different input ranges
-python -m scripts.00_vae_safety_test \
-    --data_dir step_4 \
-    --vae_path ./weights/autoencoder_v2.pt \
-    --sample_id DUKE_001_L
+# Stage 3 (Full Unfreeze + Top-K + Std Loss)
+sbatch submit_finetune_stage3.sh
+
+# Monitor Stage 3
+tail -f logs/slurm_finetune_s3_*.log
+grep "Loss Components" logs/slurm_finetune_s3_*.log | tail -20
+grep "Epoch.*Loss:" logs/slurm_finetune_s3_*.log | tail -10
 ```
 
-**IMPORTANT Finding**: The MAISI VAE (`autoencoder_v2.pt`) expects **[-1, 1] input range**, but our preprocessed data is in [0, 1]. The conversion is already applied in `diff_model_create_training_data.py` line 172:
-```python
-pt_nda = pt_nda * 2.0 - 1.0  # Convert [0,1] to [-1,1]
-```
-
-### Offline Latent Caching (Triplet Mode)
-
-Process sub/pre/mask triplets with spatial alignment to fixed 256³:
-
+### Inference
 ```bash
-python -m scripts.diff_model_create_training_data_triplet \
-    -e configs/environment_breast_sub.json \
-    -c configs/config_breast_sub_train.json \
-    -t configs/config_network_rflow.json \
-    -g 1
+# Update checkpoint path in environment config, then:
+sbatch submit_infer.sh
+
+# Visualize
+conda run -n breast_gen python -m scripts.visualize_inference_results
 ```
 
-**Plan B Strategy**:
-- All samples normalized to **exactly 256³** during caching
-- Dimensions < 256: symmetric padding
-- Dimensions > 256: mask-anchored center crop (preserves tumor location)
-- Sub: VAE-encoded to 64³ × 4 channels
-- Pre and Mask: saved at 256³ (1 channel each)
-
-**Critical Notes**:
-- **No data regeneration needed**: Your `step_4/` data is correctly preprocessed in [0, 1] range
-- **Intensity transforms skipped**: Since data is already preprocessed, `ScaleIntensityRangePercentilesd` is disabled
-- The code automatically converts [0, 1] → [-1, 1] before VAE encoding
-- Script is resumable: skips samples that already have output files
-- Only ~10% of samples require cropping (most fit within 256³ after preprocessing)
-
-### ControlNet Training
-
-Train with dilated mask-weighted loss (no CFG dropout):
-
+### TensorBoard
 ```bash
-python -m scripts.train_controlnet \
-    -e configs/environment_breast_sub.json \
-    -c configs/config_breast_controlnet.json \
-    -t configs/config_network_rflow.json \
-    -g 4
+tensorboard --logdir=tensorboard_logs/
 ```
 
-### Inference (Zero CFG)
+## Configuration Files
 
-Generate synthetic subtraction maps without masks:
+**Training**:
+- `configs/config_breast_controlnet_finetune_stage{1,2,2.5,3}.json`
+- `configs/environment_breast_sub_finetune_stage{2,2.5,3}.json`
 
-```bash
-python -m scripts.diff_model_infer \
-    -e configs/environment_breast_sub.json \
-    -c configs/config_breast_infer.json \
-    -t configs/config_network_rflow.json \
-    -g 1
+**Inference**:
+- `configs/config_breast_infer.json`
+- `configs/environment_breast_sub_infer.json`
+
+**Network**:
+- `configs/config_network_rflow.json`
+
+## Key Config Parameters
+
+**Stage 3 (Current - ROI Intensity + MSE Contrast)**:
+```json
+{
+    "use_roi_intensity_loss": true,    // Enable ROI Intensity + MSE Contrast Loss
+    "roi_intensity_weight": 0.5,       // Reduced: MSE gradients are strong
+    "weighted_loss": 10.0,             // FINAL: Tumor ×10 for dominant spatial constraint
+    "finetune_unfreeze_layers": ["up_blocks.0", "up_blocks.1", "up_blocks.2", "up_blocks.3", "middle_block"],
+    "finetune_unet_lr": 1e-5,          // UNet LR (conservative for up0)
+    "finetune_controlnet_lr": 1e-4,    // ControlNet LR
+    "batch_size": 4,                   // With gradient checkpointing
+    "use_gradient_checkpointing": true, // Memory saving
+    "val_frequency_schedule": {"107-130": 3},  // Validate every 3 epochs
+    "num_inference_steps": 20,
+    "cfg_guidance_scale": 1.0
+}
 ```
 
-**Remember**: Set `cfg_guidance_scale=1.0` (zero CFG) since model was trained without unconditional learning.
-
-### Physical Reconstruction
-
-Post-process to reconstruct full contrast-enhanced image:
-
+**Code (train_controlnet.py):**
 ```python
-# Load generated subtraction map
-sub_pred = nib.load("generated_sub.nii.gz").get_fdata()
-
-# Load original pre-contrast (patient-specific normalization)
-pre_raw = nib.load("patient_pre.nii.gz").get_fdata()
-
-# Reverse normalization (match preprocessing step)
-sub_phys = sub_pred * pre_norm_scale  # Match preprocessing scaling
-post_synthetic = pre_raw + sub_phys
-
-# Save
-nib.save(nib.Nifti1Image(post_synthetic, affine), "synthetic_post.nii.gz")
+loss_roi_total = loss_intensity + 0.1 * loss_contrast  // MSE with low weight
+loss = loss_global + 0.5 * loss_roi_total  // roi_weight=0.5, weighted_loss=10.0
 ```
 
-## Configuration Guidelines
+**Weight Tuning History:**
+1. **Initial (Asymmetric)**: `roi_weight=15, contrast=2.0` → Combined loss ~18, ROI 94% → UNSTABLE ❌
+2. **Fix (Asymmetric)**: `roi_weight=2, contrast=0.5, tumor=5` → Combined loss ~1.5, ROI 38% → **Signal scattered!** ❌
+3. **Final (MSE)**: `roi_weight=0.5, mse=0.1, tumor=10` → Combined loss ~1.07, Global L1 90% → STABLE ✅
 
-### Network Configuration (`config_network_rflow.json`)
-
+**Stage 3 (Failed - DO NOT USE)**:
 ```json
 {
-  "conditioning_embedding_in_channels": 1,  // Single-channel pre-contrast
-  "conditioning_embedding_num_channels": [16, 32, 64],
-  "use_region_contrasive_loss": false       // Disable for this task
-}
-```
-
-### ControlNet Training Config
-
-```json
-{
-  "controlnet_train": {
-    "weighted_loss": true,
-    "weighted_loss_label": [1],              // Tumor label
-    "batch_size": 2,
-    "n_epochs": 100,
-    "lr": 1e-4
-  }
-}
-```
-
-### Inference Config
-
-```json
-{
-  "modality": 9,                             // MRI_T1 from modality_mapping.json
-  "cfg_guidance_scale": 1.0,                 // Zero CFG (no classifier-free guidance)
-  "num_inference_steps": 20,                 // Rectified Flow: 10-50 steps
-  "output_size": [256, 256, 256],
-  "spacing": [0.7, 0.7, 1.2]                 // Z, Y, X spacing in mm
-}
-```
-
-### Cached Dataset Format
-
-The `dataset_breast_cached.json` has explicit "training" and "validation" keys:
-
-```json
-{
-  "training": [
-    {
-      "image": "embeddings_breast_sub/DUKE_001_L_sub_emb.nii.gz",
-      "pre": "processed_pre/DUKE_001_L_pre_aligned.nii.gz",
-      "label": "processed_mask/DUKE_001_L_mask_aligned.nii.gz",
-      "spacing": [1.2, 0.7, 0.7],
-      "modality": "mri"
-    },
-    ...
-  ],
-  "validation": [...]
-}
-```
-
-**Key points**:
-- `spacing`: Physical voxel size [Z, Y, X] in mm, used for:
-  - Setting output NIfTI affine matrix
-  - Passed to model as spatial encoding
-  - Output filename includes spacing info
-- Paths are relative to project root
-- `scripts/utils.py` automatically detects this format (checks for "validation" key)
-
-## Critical Implementation Notes
-
-### VAE Input Range
-
-**IMPORTANT**: MAISI VAE expects **[-1, 1] input range**, but preprocessed data is [0, 1].
-
-```python
-# In diff_model_create_training_data.py, line 172:
-pt_nda = pt_nda * 2.0 - 1.0  # Convert [0,1] to [-1,1]
-```
-
-**Why this matters**: Without this conversion, VAE produces negative artifacts in reconstruction (e.g., [-0.27, 1.45] output for [0, 1] input). The `00_vae_safety_test.py` script detects this issue automatically.
-
-**Note**: No need to regenerate `step_4/` data - the conversion happens at encoding time.
-
-### Mask Downsampling for Latent Loss
-
-Always dilate masks in **physical space first**, then downsample:
-
-```python
-# WRONG: Downsample then dilate (loses small tumors)
-mask_latent = F.interpolate(mask, size=(64,64,64), mode='nearest')
-dilated = F.max_pool3d(mask_latent, kernel_size=3)
-
-# CORRECT: Dilate then downsample (preserves tumors)
-from monai.transforms.utils_morphological_ops import dilate
-dilated_phys = dilate(mask, iterations=2)
-mask_latent = F.interpolate(dilated_phys, size=(64,64,64), mode='nearest')
-```
-
-### Modality Configuration
-
-Add breast MRI modalities to `configs/modality_mapping.json`:
-
-```json
-{
-  "mri_t1_breast": 18,
-  "mri_dce_breast": 19,
-  "mri_sub_breast": 20
-}
-```
-
-### Body Region for Breast
-
-In `scripts/find_masks.py`, add breast region:
-
-```python
-region_mapping_maisi = {
-    # ... existing regions ...
-    "breast": 4,
-    "chest/breast": 1
+    "use_topk_loss": true,         // ❌ Ignored 70% of pixels
+    "topk_ratio": 0.3,
+    "use_std_loss": true,          // ❌ Only constrained variance
+    "std_loss_weight": 1.0
 }
 ```
 
 ## Troubleshooting
 
-### VAE Encoding Produces All-Black Latents
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Loss stuck at ~0.86 | Easy background diluting gradients | Use Top-K Loss (Stage 2.5) |
+| Tumor signal weak (89%) | Insufficient contrast matching | Use ROI Intensity Loss (Stage 3 new) |
+| Tumor boundary blurry | Limited model capacity | Unfreeze more layers (Stage 3) |
+| **Background all white** | **Top-K + up0 unfreeze = no background constraint** | **Use Global L1 + ROI Intensity** |
+| **Loss explodes to ~18** | **ROI weight too high (15) + Contrast too aggressive (2.0)** | **Reduce: roi_weight=2, contrast=0.5** |
+| **"Average trap"** | **Only using mean intensity loss** | **Add Asymmetric Contrast Loss (F.relu)** |
+| **Signal scattered (mean 6%)** | **Asymmetric contrast allows weak pixels** | **Use MSE Contrast + Tumor weight 10×** |
+| OOM in Stage 3 | Too many parameters unfrozen | Enable gradient checkpointing |
+| Loss > 3.0 | Unstable training | Reduce learning rate or loss weights |
+| NaN in validation | Problematic sample | Auto-skipped in dataloader |
+| Training too slow | Gradient checkpointing overhead | Expected trade-off |
 
-- **Cause**: VAE expects `[-1, 1]` input but received `[0, 1]`
-- **Fix**: Multiply by 2.0 and subtract 1.0 before encoding
+### Stage 3 Post-Mortem (Failed)
 
-### Training Generates Snow in Background
+**Symptoms:**
+- Pred min: 0.50 (should be ~0.0)
+- Pred mean: 0.88 (GT mean: 0.05)
+- MAE: 0.83 (Stage 2.5: 0.048)
+- Peak center: (128, 128, 128) = image center, NOT tumor location
 
-- **Cause**: Subtraction map has non-zero background or CFG was used
-- **Fix**: Ensure `Sub[Sub < 0] = 0` in preprocessing; disable CFG in inference
+**Root Cause Analysis:**
+```
+Top-K Loss (30%) + Unfrozen up_blocks.0 = Disaster
 
-### Tumor Location Shifted
+1. Top-K ignores 70% easiest pixels → background ignored
+2. Std Loss only constrains variance, not mean
+3. up_blocks.0 (80M params) controls global style
+4. No gradient signal from background → unconstrained
+5. Model optimizes Std Loss by filling background
+6. Result: Entire image becomes high intensity
+```
 
-- **Cause**: VAE receptive field edge effect not compensated
-- **Fix**: Increase mask dilation iterations or kernel size
+**Solution (Stage 3 New):**
+- Global L1: Every pixel has weight (bg=1.0, tumor=5.0)
+- ROI Intensity: Focus on tumor mean, not spatial pattern
+- Result: Background constrained + tumor signal boosted
 
-### Losses Not Decreasing
+### Stage 3 Epoch 114 Results (MSE Contrast Loss)
 
-- **Cause**: Learning rate too high or backbone not frozen
-- **Fix**: Verify `requires_grad=False` for DiT/U-Net parameters; reduce LR to 5e-5
+**Improvement over Stage 2.5 (Top-K)**:
+- Max: 20.8% → 25.1% (**+4.3%**)
+- Mean: 22.9% → 29.9% (**+7.0%**)
+- 3 samples tested, all show consistent gains (+3.8%~7.1%)
 
-### Inconsistent Tensor Shapes During Training
+**Issue**: Still no pixels > 0.5 (GT has 69.7% > 0.5)
+**Status**: Direction correct, need more epochs or higher MSE weight
 
-- **Cause**: Samples not properly normalized to 256³ during caching
-- **Fix**: Verify all cached outputs are exactly 256³ (physical) or 64³ (latent). Check `normalize_to_fixed_size()` implementation for mask-anchored cropping logic.
+## Checkpoint Files
+
+```
+# Training checkpoints
+weights/breast_sub_controlnet_epoch_58.pt                    # Pre-finetuning
+weights/breast_sub_controlnet_finetune_epoch_70.pt           # Stage 1 end
+weights/breast_sub_controlnet_finetune_s2_epoch_100.pt       # Stage 2 end
+weights/breast_sub_controlnet_finetune_s2_best.pt            # Stage 2 best
+weights/breast_sub_controlnet_finetune_s2_5_topk_epoch_107.pt # Stage 2.5 end
+weights/breast_sub_controlnet_finetune_s2_5_topk_best.pt     # Stage 2.5 best (Val Loss: 0.8526)
+
+# Stage 3 (Failed - DO NOT USE)
+weights/breast_sub_controlnet_finetune_s3_best.pt            # Contains broken UNet state
+weights/breast_sub_controlnet_finetune_s3_epoch_*.pt         # Background all white
+
+# Diffusion backbone (NEVER modified by training)
+weights/diff_unet_3d_rflow-mr.pt                            # Original MAISI UNet
+```
+
+**Note**: Finetuned UNet states are stored in checkpoint as `unet_finetuned_state_dict`. Original `diff_unet_3d_rflow-mr.pt` is never modified.
+
+## Inference Output Format
+
+```
+output_breast_sub_infer_s2_5_e107/
+  ├── DUKE_XXX_L_pred_sub.nii.gz  # Predicted subtraction
+  ├── DUKE_XXX_L_gt_sub.nii.gz    # Ground truth
+  └── visualizations/
+      └── DUKE_XXX_L_comparison.png
+```
 
 ## File Organization
 
 ```
 breast-sub-gen/
-├── scripts/              # All training/inference code
-├── configs/              # JSON configuration files
-├── step_4/               # Preprocessed data (see metadata CSV)
+├── scripts/              # Training/inference code
+├── configs/              # JSON configurations
+├── step_4/               # Preprocessed data
 ├── weights/              # Model checkpoints
-├── data/                 # Raw data links
-└── tutorial/             # Jupyter notebooks for examples
+├── logs/                 # Training logs
+├── output_*/             # Inference outputs
+└── dataset_breast_cached.json
 ```
 
-## Key References
+## Training Strategy Evolution
 
-- MAISI Framework: Based on MONAI Consortium implementation
-- Rectified Flow: Requires fewer sampling steps than DDPM
-- Sparse Signal Learning: Subtraction maps are ~95% background zeros
+1. **Stage 1-2**: Progressive unfreezing, standard weighted L1 loss
+   - Result: Baseline performance, loss ~0.86
 
----
+2. **Stage 2.5**: Top-K Loss (30% hard pixels)
+   - Result: Val Loss 0.8526, tumor signal 89%
+   - Status: ✅ Working, background pure black
+   - Issue: Signal slightly weak, boundaries blurry
 
-# Triplet-Based Training Pipeline (Current Implementation)
+3. **Stage 3 (Failed)**: Top-K + Std Loss + up_blocks.0 unfrozen
+   - Result: Background all white, MAE 0.83
+   - Root cause: Top-K ignored background + up0 unconstrained
+   - Status: ❌ Abandoned
 
-**Status**: Offline latent caching in progress (started 2026-02-25)
+4. **Stage 3 (Attempt 1)**: Global L1 + ROI Intensity + Asymmetric Contrast
+   - Result: Signal scattered (mean 6% of GT), predictions nearly black
+   - Root cause: Asymmetric contrast allowed model to spread signal thinly
+   - Status: ❌ Failed
 
-## Overview
+5. **Stage 3 (Current)**: Global L1 (10×) + ROI Intensity + MSE Contrast
+   - Goal: Background pure black + tumor signal >95% WITHOUT scattering
+   - Strategy: MSE squared penalty forces spatial matching, high tumor weight prevents dispersion
+   - Start: From Stage 2.5 Epoch 107 (clean UNet)
 
-This project uses a **triplet-based training approach** where:
-- **Sub (subtraction map)**: VAE-encoded to latent space (64³, 4 channels) - diffusion target
-- **Pre (pre-contrast)**: Resized and aligned (256³, 1 channel) - controlnet condition
-- **Mask**: Resized and aligned (256³, 1 channel) - loss weighting
+## References
 
-All three files undergo the SAME spatial transforms to ensure spatial consistency.
+- MAISI Framework: MONAI Consortium
+- Rectified Flow: Fewer sampling steps than DDPM
+- Top-K Loss: Hard example mining for sparse signals
+- **Ibarra et al. ROI Intensity Loss**: Mean intensity matching in tumor regions
 
-## New Files Created
+## Code Changes (2026-02-27)
 
-### Scripts
-- `scripts/create_breast_dataset.py` - Generates dataset_breast.json with triplet format
-- `scripts/diff_model_create_training_data_triplet.py` - Processes sub/pre/mask triplets with spatial alignment
-- `scripts/create_stratified_cached_dataset.py` - Generates stratified train/val split with patient-level grouping
+### 1. Modified `train_controlnet.py` (lines 643-670)
 
-### Configs
-- `configs/environment_breast_sub.json` - Environment config for triplet caching
-- `configs/environment_breast_sub_triplet.json` - Environment config for triplet training
-- `configs/config_breast_controlnet.json` - ControlNet training config
-
-### Documentation
-- `TRIPLET_IMPLEMENTATION_SUMMARY.md` - Complete implementation guide
-
-## Modified Files
-- `scripts/train_controlnet.py` - Uses pre images as controlnet condition (instead of binary labels)
-- `scripts/utils.py` - Supports triplet data loading with "pre", "image", "label" keys; **supports cached dataset format** with explicit "training"/"validation" keys; **no dynamic cropping** (all samples fixed at 256³)
-
-## Current Progress (2026-02-25)
-
-### Step 1: ✅ Dataset JSON Created
-```bash
-python -m scripts.create_breast_dataset --input step_4 --output dataset_breast.json
-# Result: dataset_breast.json with 1943 samples
-```
-
-### Step 2: ✅ Offline Latent Caching (COMPLETE - Fixed 256³ Strategy)
-
-**Completed**: 2026-02-25 13:02
-
-**Plan B Strategy**:
-- All samples normalized to **exactly 256³** (physical space)
-- Dimensions < 256: **symmetric padding**
-- Dimensions > 256: **mask-anchored center crop** (preserves tumor location)
-- Latent space: **64³ × 4 channels** (VAE downsamples by 4x)
-
-**Output**:
-- `embeddings_breast_sub/` - Sub_emb files (64³, 4 channels) - **1943 files**
-- `processed_pre/` - Pre_aligned files (256³, 1 channel) - **1943 files**
-- `processed_mask/` - Mask_aligned files (256³, 1 channel) - **1943 files**
-
-### Step 2.5: ✅ Stratified Train/Val Split (COMPLETE)
-
-**Completed**: 2026-02-25 13:44
-
-**Split Strategy**: Patient-level stratified sampling (三层分层抽样)
-- **Layer 1**: Dataset (DUKE/ISPY1/ISPY2/NACT)
-- **Layer 2**: Tumor status (has_tumor=0/1)
-- **Layer 3**: Patient grouping (Original_ID)
-
-**Result**:
-| Split | Samples | Patients |
-|-------|---------|----------|
-| Train | 1553 (79.9%) | 1203 |
-| Val | 390 (20.1%) | 301 |
-| **Total** | **1943** | **1504** |
-
-**Validation**:
-- ✅ No patient overlap (prevents data leakage)
-- ✅ Dataset proportions maintained (DUKE: 29.4%, ISPY1: 9.0%, ISPY2: 58.3%, NACT: 3.3%)
-- ✅ Tumor proportions maintained (77.4% with tumor)
-
-**Command**:
-```bash
-conda run -n breast_gen python -m scripts.create_stratified_cached_dataset \
-    --metadata-csv step_4/step_4_metadata.csv \
-    --input dataset_breast.json \
-    --output dataset_breast_cached.json \
-    --embedding-dir ./embeddings_breast_sub \
-    --pre-dir ./processed_pre \
-    --mask-dir ./processed_mask \
-    --val-ratio 0.2 \
-    --random-seed 42
-```
-
-**Output**: `dataset_breast_cached.json` with explicit "training" and "validation" keys
-
-### Step 3: ⏳ Start ControlNet Training (READY)
-
-The cached dataset is ready. `environment_breast_sub_triplet.json` already points to `dataset_breast_cached.json`.
-
-```bash
-conda run -n breast_gen python -m scripts.train_controlnet \
-    -e configs/environment_breast_sub_triplet.json \
-    -c configs/config_breast_controlnet.json \
-    -t configs/config_network_rflow.json \
-    -g 4
-```
-
-## Resumability
-
-**If caching process is interrupted**: Simply re-run the same command. The script checks if output files already exist and skips completed samples.
-
-**To verify cached data** (works during or after caching):
+**Before (Top-K + Std):**
 ```python
-python3 << 'EOF'
-import json
-import glob
-import os
-
-# Use original dataset to get expected count
-with open('dataset_breast.json') as f:
-    expected = len(json.load(f)['training'])
-
-sub_count = len(glob.glob('embeddings_breast_sub/*_sub_emb.nii.gz')) if os.path.exists('embeddings_breast_sub') else 0
-pre_count = len(glob.glob('processed_pre/*_pre_aligned.nii.gz')) if os.path.exists('processed_pre') else 0
-mask_count = len(glob.glob('processed_mask/*_mask_aligned.nii.gz')) if os.path.exists('processed_mask') else 0
-
-print(f'Expected: {expected}')
-print(f'Sub: {sub_count}, Pre: {pre_count}, Mask: {mask_count}')
-print(f'Progress: {sub_count}/{expected} ({100*sub_count//expected if expected > 0 else 0}%)')
-print(f'Status: {"✓ COMPLETE" if sub_count == pre_count == mask_count == expected else "⏳ IN PROGRESS"}')
-EOF
+use_topk = args.controlnet_train.get("use_topk_loss", False)
+if use_topk:
+    loss_topk = compute_topk_loss(model_output, model_gt, weights, topk_ratio)
+    loss = loss_topk
+    if use_std_loss:
+        std_pred = torch.std(model_output.float(), dim=[1, 2, 3, 4])
+        std_gt = torch.std(model_gt.float(), dim=[1, 2, 3, 4])
+        loss_std = F.l1_loss(std_pred, std_gt)
+        loss = loss_topk + std_loss_weight * loss_std
 ```
 
-## Task Persistence
+**After (Global L1 + ROI Intensity):**
+```python
+use_roi_intensity = args.controlnet_train.get("use_roi_intensity_loss", False)
+roi_intensity_weight = args.controlnet_train.get("roi_intensity_weight", 1.0)
 
-**Important**: Implementation tasks are tracked in Claude's internal task system (not local files). If you restart Claude:
-1. Use `/tasks` command to view all tasks
-2. Use `/tasks resume <task_id>` to resume any task
-3. All code changes remain in the repository
-4. Background processes continue running independently
+# Global weighted L1 (constrains ALL pixels)
+l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
+loss_global = (l1_loss_raw * weights).mean()
 
-To stop a background process:
-```bash
-# Find the process
-ps aux | grep diff_model_create_training_data_triplet
-
-# Kill it
-kill <PID>
+if use_roi_intensity:
+    roi_mask = (interpolate_label > 0.5)
+    if roi_mask.sum() > 0:
+        roi_mask_expanded = roi_mask.repeat(1, images.shape[1], 1, 1, 1)
+        pred_roi = model_output.float()[roi_mask_expanded]
+        gt_roi = model_gt.float()[roi_mask_expanded]
+        loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+    else:
+        loss_intensity = torch.tensor(0.0, device=model_output.device)
+    loss = loss_global + roi_intensity_weight * loss_intensity
+else:
+    loss = loss_global
 ```
+
+### 2. Modified `config_breast_controlnet_finetune_stage3.json`
+
+**Changes:**
+- Removed: `"use_topk_loss"`, `"topk_ratio"`, `"use_std_loss"`, `"std_loss_weight"`
+- Added: `"use_roi_intensity_loss": true`, `"roi_intensity_weight": 1.0`
+- Changed: `"val_frequency_schedule": {"107-130": 3}` (more frequent validation)
+
+### 3. Fixed `infer_breast_sub.py`
+
+**Issue**: Incorrectly applied `1.0 - x` inversion to both prediction and GT
+**Fix**: Removed inversion (training was in latent space without decoding)
+
+**Before:**
+```python
+pred_sub_np = 1.0 - pred_sub_np  # WRONG
+gt_decoded_np = 1.0 - gt_decoded_np  # WRONG
+```
+
+**After:**
+```python
+# No inversion needed - training in latent space
+pred_sub_np = (pred_sub + 1.0) / 2.0
+gt_decoded_np = (gt_decoded + 1.0) / 2.0
+```
+
+### 4. Added Asymmetric Contrast Loss (2026-02-27 16:00)
+
+**Issue**: Only using mean intensity loss leads to "average trap" - model cheats with half bright/half dark pixels
+
+**Solution**: Added Ibarra et al.'s asymmetric contrast loss that only penalizes under-estimated pixels
+
+**Before (Stage 3 Attempt 1):**
+```python
+# Only mean intensity - vulnerable to cheating!
+loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+loss_roi_total = loss_intensity
+loss = loss_global + roi_intensity_weight * loss_roi_total
+```
+
+**After (Stage 3 Current):**
+```python
+# Mean intensity + asymmetric contrast
+loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+
+# F.relu only penalizes dark pixels, ignores bright ones
+under_estimated = F.relu(gt_roi - pred_roi)
+loss_contrast = under_estimated.mean()
+
+# Combined with balanced weights
+loss_roi_total = loss_intensity + 0.5 * loss_contrast  # FINAL: 0.5, not 2.0
+loss = loss_global + 2.0 * loss_roi_total  # FINAL: roi_weight=2.0, not 15
+```
+
+**Config Changes:**
+- `roi_intensity_weight`: 15 → 2 (reduced to prevent dominating training)
+- `contrast_weight`: 2.0 → 0.5 (in code, not config)
+
+**Results:**
+- Training loss: ~18 (unstable) → ~1.5 (stable)
+- ROI占比: 94% → 38% (healthy balance)
+- Global L1 占比: 6% → 62% (background control restored)
+
+### 5. Re-enabled Inference Inversion (2026-02-27 15:40)
+
+**Discovery**: Model outputs are inverted (background=1, tumor=0) - this is expected behavior
+
+**Fix**: Added `1.0 - x` inversion back to inference code
+
+```python
+# Convert to [0,1] then invert
+pred_sub_np = (pred_sub + 1.0) / 2.0
+pred_sub_np = np.clip(pred_sub_np, 0, 1)
+pred_sub_np = 1.0 - pred_sub_np  # Re-enabled
+```
+
+### 6. Switched to MSE Contrast Loss (2026-02-27 17:15)
+
+**Issue**: Asymmetric contrast loss caused signal scattering - model satisfied mean constraint with many weak pixels
+
+**Inference Results (Attempt 1)**:
+- Pred mean: 0.003 vs GT mean: 0.048 (only **6%**!)
+- Pixels > 0.1: 1.36% vs GT 12.40% (only **11%**!)
+- Visual result: Predictions nearly all black
+
+**Root Cause**:
+- `F.relu(gt - pred).mean()` only penalizes under-estimation
+- Model "cheats" by spreading signal into many weak pixels
+- Satisfies mean constraint but fails spatial distribution
+
+**Solution**: MSE Contrast Loss with higher tumor weight
+
+**Before (Asymmetric - Attempt 1):**
+```python
+# Tumor weight 5×, asymmetric contrast
+loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+under_estimated = F.relu(gt_roi - pred_roi)
+loss_contrast = under_estimated.mean()
+loss_roi_total = loss_intensity + 0.5 * loss_contrast
+loss = loss_global + 2.0 * loss_roi_total
+```
+
+**After (MSE - Current):**
+```python
+# Tumor weight 10×, MSE contrast (squared penalty!)
+loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+loss_contrast = F.mse_loss(pred_roi, gt_roi)  # KEY: MSE gradient = 2×(pred-gt)
+loss_roi_total = loss_intensity + 0.1 * loss_contrast  # Low weight: MSE gradients strong
+loss = loss_global + 0.5 * loss_roi_total  # roi_weight=0.5
+```
+
+**Why MSE Works**:
+| Metric | L1 Gradient | MSE Gradient |
+|--------|-------------|-------------|
+| Error 0.1 (GT=1.0, Pred=0.9) | -1.0 | -0.2 |
+| Error 0.9 (GT=1.0, Pred=0.1) | -1.0 | **-1.8** |
+
+MSE gives **80% stronger gradient** for large outliers, forcing model to rebuild high peaks!
+
+**Config Changes:**
+- `weighted_loss`: 5.0 → **10.0** (dominant spatial constraint)
+- `roi_intensity_weight`: 2.0 → **0.5** (MSE gradients strong)
+- `mse_weight`: 0.5 → **0.1** (in code, prevents instability)
+
+**Expected Results**:
+- Global L1 ~90%: Strong spatial pattern constraint
+- ROI ~10%: Sufficient for mean + contrast matching
+- Tumor 10×: Prevents signal scattering

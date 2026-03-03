@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import argparse
 import json
 import logging
@@ -22,12 +23,14 @@ import torch.distributed as dist
 from monai.utils import RankFilter
 
 
-def setup_logging(logger_name: str = "") -> logging.Logger:
+def setup_logging(logger_name: str = "", log_file: str = None) -> logging.Logger:
     """
     Setup the logging configuration.
 
     Args:
         logger_name (str): logger name.
+        log_file (str, optional): Path to log file. If provided, logs will be written to this file
+                                  in addition to stdout. Defaults to None.
 
     Returns:
         logging.Logger: Configured logger.
@@ -35,11 +38,37 @@ def setup_logging(logger_name: str = "") -> logging.Logger:
     logger = logging.getLogger(logger_name)
     if dist.is_initialized():
         logger.addFilter(RankFilter())
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s.%(msecs)03d][%(levelname)5s](%(name)s) - %(message)s",
+
+    # Clear any existing handlers to avoid duplicates
+    logger.handlers.clear()
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt="[%(asctime)s.%(msecs)03d][%(levelname)5s](%(name)s) - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # Add stdout handler (so SLURM captures to .log file)
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    root_logger.addHandler(stdout_handler)
+
+    # Add file handler if log_file is specified
+    if log_file is not None:
+        # Ensure directory exists
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+    root_logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+
     return logger
 
 

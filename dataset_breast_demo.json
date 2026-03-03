@@ -1,0 +1,83 @@
+{
+  "training": [
+    {
+      "image": "embeddings_breast_sub/DUKE_001_L_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_001_L_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_001_L_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    }
+  ],
+  "validation": [
+    {
+      "image": "embeddings_breast_sub/DUKE_021_L_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_021_L_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_021_L_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    },
+    {
+      "image": "embeddings_breast_sub/DUKE_021_R_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_021_R_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_021_R_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    },
+    {
+      "image": "embeddings_breast_sub/DUKE_022_L_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_022_L_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_022_L_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    },
+    {
+      "image": "embeddings_breast_sub/DUKE_022_R_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_022_R_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_022_R_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    },
+    {
+      "image": "embeddings_breast_sub/DUKE_041_L_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_041_L_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_041_L_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    },
+    {
+      "image": "embeddings_breast_sub/DUKE_041_R_sub_emb.nii.gz",
+      "pre": "processed_pre/DUKE_041_R_pre_aligned.nii.gz",
+      "label": "processed_mask/DUKE_041_R_mask_aligned.nii.gz",
+      "spacing": [
+        1.2,
+        0.7,
+        0.7
+      ],
+      "modality": "mri"
+    }
+  ]
+}

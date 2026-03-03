@@ -28,7 +28,7 @@ from monai.config import DtypeLike, NdarrayOrTensor
 from monai.data import CacheDataset, DataLoader, partition_dataset
 from monai.transforms import (
     Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd,
-    RandGaussianNoise, RandAdjustContrastd
+    RandGaussianNoised, RandAdjustContrastd
 )
 from monai.transforms.utils_morphological_ops import dilate, erode
 from monai.utils import TransformBackends, convert_data_type, convert_to_dst_type, get_equivalent_dtype
@@ -365,7 +365,7 @@ def prepare_maisi_controlnet_json_dataloader(
             EnsureTyped(keys=["pre"], dtype=torch.float32, track_meta=False),
             EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
             # Intensity augmentations for pre images only
-            RandGaussianNoise(
+            RandGaussianNoised(
                 keys=["pre"],
                 prob=0.15,           # Conservative probability
                 mean=0.0,

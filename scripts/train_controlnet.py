@@ -18,6 +18,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -30,7 +31,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from .utils import binarize_labels, define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
+from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
 from .augmentation import remove_tumors
 
@@ -113,6 +114,48 @@ def compute_region_contrasive_loss(
     loss_region_bg = (loss_contrastive(model_output_roi_free, model_gt)*roi_contrastive_bg).sum()/(torch.sum(roi_contrastive_bg>0)+1e-5)
     return loss_region_contrasive, loss_region_bg
 
+def compute_topk_loss(
+    pred,
+    gt,
+    weights,
+    topk_ratio=0.3
+):
+    """
+    Top-K Hard Example Mining Loss for sparse signal learning.
+
+    Instead of averaging over ALL pixels (including 95% easy background),
+    only compute loss on the hardest 30% pixels. This forces the model to
+    focus on difficult tumor boundaries and faint signals.
+
+    Args:
+        pred (torch.Tensor): Model prediction. Shape [B, C, X, Y, Z].
+        gt (torch.Tensor): Ground truth. Shape [B, C, X, Y, Z].
+        weights (torch.Tensor): Per-pixel weights (e.g., tumor region mask).
+            Shape [B, C, X, Y, Z].
+        topk_ratio (float): Ratio of hardest pixels to use (default 0.3 = 30%).
+
+    Returns:
+        torch.Tensor: Scalar loss averaged over top-k hardest pixels.
+
+    Note:
+        Loss values will be HIGHER than standard weighted L1 (e.g., ~1.5 vs ~0.86)
+        because we remove easy samples from the denominator. This is EXPECTED and
+        indicates the model is focusing on hard examples.
+    """
+    # 1. Compute per-pixel weighted L1 loss (no reduction)
+    l1_loss_raw = F.l1_loss(pred.float(), gt.float(), reduction="none") * weights
+
+    # 2. Flatten to [B, C*X*Y*Z]
+    B = l1_loss_raw.size(0)
+    l1_loss_flat = l1_loss_raw.view(B, -1)
+
+    # 3. Select top-k hardest pixels
+    k = max(1, int(l1_loss_flat.size(1) * topk_ratio))  # Ensure at least 1 pixel
+    topk_loss, _ = torch.topk(l1_loss_flat, k, dim=1)
+
+    # 4. Average only over hard examples
+    return topk_loss.mean()
+
 def compute_model_output(
     images,labels,noise,timesteps,noise_scheduler,
     controlnet,unet,
@@ -174,22 +217,13 @@ def compute_model_output(
     include_modality = ( modality_tensor is not None )
     include_body_region = ( top_region_index_tensor is not None) and (bottom_region_index_tensor is not None)
 
-    # Build controlnet condition: use pre_images if provided, otherwise binarize labels
-    if pre_images is not None:
-        # Use pre-contrast images as conditioning (single channel)
-        # Pre images are at physical resolution (256³), need to interpolate to latent space (64³)
-        controlnet_cond = F.interpolate(
-            pre_images.float(),
-            size=images.shape[2:],
-            mode='trilinear',
-            align_corners=False
-        )
-        # Ensure single channel input
-        if controlnet_cond.shape[1] != 1:
-            controlnet_cond = controlnet_cond[:, :1, ...]
-    else:
-        # Fallback to original behavior: binary encoding of segmentation mask
-        controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+    # Build controlnet condition: use pre-contrast images as conditioning
+    # Pre images are at physical resolution (256³). The Conditioning Embedding layer
+    # (3 strided convolutions) will handle downsampling to 64³ while extracting features.
+    controlnet_cond = pre_images.float()
+    # Ensure single channel input
+    if controlnet_cond.shape[1] != 1:
+        controlnet_cond = controlnet_cond[:, :1, ...]
 
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
@@ -242,7 +276,11 @@ def train_controlnet(
     env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int
 ) -> None:
     # Step 0: configuration
-    logger = logging.getLogger("maisi.controlnet.training")
+    # Setup logging to stdout and file
+    log_file = "training_latest.log"
+    logger = setup_logging("maisi.controlnet.training", log_file=log_file)
+    logger.info(f"Logging configured: stdout + {log_file}")
+
     # whether to use distributed data parallel
     use_ddp = num_gpus > 1
     if use_ddp:
@@ -307,21 +345,95 @@ def train_controlnet(
 
     # define ControlNet
     controlnet = define_instance(args, "controlnet_def").to(device)
+    # Log ControlNet structure to verify Conditioning Embedding is included
+    logger.info(f"ControlNet type: {type(controlnet).__name__}")
+    # Check if Conditioning Embedding exists
+    has_cond_emb = hasattr(controlnet, "conditioning_embedding")
+    logger.info(f"Has Conditioning Embedding: {has_cond_emb}")
+    if has_cond_emb:
+        cond_emb = controlnet.conditioning_embedding
+        logger.info(f"Conditioning Embedding: {type(cond_emb).__name__}")
+        logger.info(f"  - Input channels: {getattr(cond_emb, 'in_channels', 'N/A')}")
+        if hasattr(cond_emb, 'out_channels'):
+            logger.info(f"  - Output channels: {cond_emb.out_channels}")
+
     # copy weights from the DM to the controlnet
     copy_model_state(controlnet, unet.state_dict())
     # load trained controlnet model if it is provided
+    start_epoch = 0
     if args.existing_ckpt_filepath is not None:
         if not os.path.exists(args.existing_ckpt_filepath):
             raise ValueError("Please download the trained ControlNet checkpoint.")
-        controlnet.load_state_dict(
-            torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)["controlnet_state_dict"]
-        )
+        checkpoint = torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)
+        controlnet.load_state_dict(checkpoint["controlnet_state_dict"])
+
+        # Load fine-tuned UNet if available (for Stage 2/3 continuation)
+        if "unet_finetuned_state_dict" in checkpoint:
+            unet.load_state_dict(checkpoint["unet_finetuned_state_dict"])
+            logger.info(f"Loaded fine-tuned UNet from {args.existing_ckpt_filepath}")
+
+        # Resume from checkpoint epoch
+        start_epoch = checkpoint.get("epoch", 0)
         logger.info(f"load trained controlnet model from {args.existing_ckpt_filepath}")
+        logger.info(f"resuming from epoch {start_epoch}")
     else:
         logger.info("train controlnet model from scratch.")
     # we freeze the parameters of the diffusion model.
     for p in unet.parameters():
         p.requires_grad = False
+
+    # Verify freezing and log trainable parameter count
+    unet_trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    controlnet_trainable = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
+    total_trainable = controlnet_trainable + unet_trainable
+
+    logger.info(f"=== Parameter Freezing Status ===")
+    logger.info(f"DiT/U-Net trainable parameters: {unet_trainable:,} (should be 0)")
+    logger.info(f"ControlNet trainable parameters: {controlnet_trainable:,}")
+    logger.info(f"Total trainable parameters: {total_trainable:,}")
+
+    if unet_trainable > 0:
+        raise ValueError("ERROR: DiT/U-Net has trainable parameters! Check freezing logic.")
+
+    # Fine-tuning mode: selectively unfreeze U-Net layers if configured
+    def unfreeze_unet_layers(unet, layer_names):
+        """
+        Unfreeze specific U-Net layers for fine-tuning.
+
+        Args:
+            unet: DiT/U-Net model
+            layer_names: List of layer prefixes to unfreeze (e.g., ['up_blocks.2', 'up_blocks.3'])
+
+        Returns:
+            Number of newly trainable parameters
+        """
+        newly_trainable = 0
+        for name, param in unet.named_parameters():
+            if param.requires_grad:
+                continue  # Already trainable
+            for layer_name in layer_names:
+                if name.startswith(layer_name):
+                    param.requires_grad = True
+                    newly_trainable += param.numel()
+                    logger.info(f"  Unfrozen: {name} ({param.numel():,} params)")
+
+        return newly_trainable
+
+    # Check if fine-tuning mode is enabled
+    if 'finetune_unfreeze_layers' in args.controlnet_train:
+        unfreeze_layers = args.controlnet_train['finetune_unfreeze_layers']
+        new_params = unfreeze_unet_layers(unet, unfreeze_layers)
+
+        # Re-count trainable parameters
+        unet_trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        controlnet_trainable = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
+        total_trainable = controlnet_trainable + unet_trainable
+
+        logger.info(f"=== Fine-Tuning Mode: Stage {args.controlnet_train.get('finetune_stage', 1)} ===")
+        logger.info(f"Newly unfrozen: {new_params:,} parameters")
+        logger.info(f"Total trainable: {total_trainable:,} parameters")
+        logger.info(f"  ControlNet: {controlnet_trainable:,}")
+        logger.info(f"  DiT/U-Net: {unet_trainable:,}")
 
     noise_scheduler = define_instance(args, "noise_scheduler")
 
@@ -340,7 +452,7 @@ def train_controlnet(
     else:
         args.modality_mapping = None
 
-    train_loader, _ = prepare_maisi_controlnet_json_dataloader(
+    train_loader, val_loader = prepare_maisi_controlnet_json_dataloader(
         json_data_list=args.json_data_list,
         data_base_dir=args.data_base_dir,
         rank=rank,
@@ -350,21 +462,68 @@ def train_controlnet(
         fold=args.controlnet_train["fold"],
         modality_mapping = args.modality_mapping
     )
+    logger.info(f"Training samples: {len(train_loader.dataset)}, Validation samples: {len(val_loader.dataset)}")
 
     # Step 3: training config
     weighted_loss = args.controlnet_train["weighted_loss"]
     weighted_loss_label = args.controlnet_train["weighted_loss_label"]
-    optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
+
+    # Top-K Loss config (hard example mining)
+    use_topk = args.controlnet_train.get("use_topk_loss", False)
+    topk_ratio = args.controlnet_train.get("topk_ratio", 0.3)
+    if use_topk:
+        logger.info(f"=== Top-K Hard Example Mining Loss ENABLED ===")
+        logger.info(f"  Top-K ratio: {topk_ratio*100:.1f}% (hardest pixels only)")
+        logger.info(f"  Expected loss range: ~1.5-2.5 (higher than standard L1!)")
+
+    # Build optimizer with differential learning rates if in fine-tuning mode
+    if 'finetune_stage' in args.controlnet_train:
+        # Fine-tuning mode: separate LRs for ControlNet and UNet
+        controlnet_lr = args.controlnet_train.get('finetune_controlnet_lr', 1e-4)
+        unet_lr = args.controlnet_train.get('finetune_unet_lr', 1e-5)
+
+        # Collect parameters by group
+        if world_size > 1:
+            controlnet_params = list(controlnet.module.parameters())
+        else:
+            controlnet_params = list(controlnet.parameters())
+        unet_params = [p for p in unet.parameters() if p.requires_grad]
+
+        param_groups = [
+            {'params': controlnet_params, 'lr': controlnet_lr, 'name': 'controlnet'},
+            {'params': unet_params, 'lr': unet_lr, 'name': 'unet_finetune'}
+        ]
+
+        optimizer = torch.optim.AdamW(param_groups)
+        logger.info(f"Differential learning rates:")
+        logger.info(f"  ControlNet: {controlnet_lr:.2e}")
+        logger.info(f"  UNet finetune: {unet_lr:.2e}")
+    else:
+        # Original: ControlNet only
+        if world_size > 1:
+            optimizer = torch.optim.AdamW(params=controlnet.module.parameters(), lr=args.controlnet_train["lr"])
+        else:
+            optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
+
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
 
     lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=total_steps, power=2.0)
 
+    def should_validate(epoch, val_schedule):
+        """Determine if validation should run this epoch based on schedule."""
+        for epoch_range_str, frequency in val_schedule.items():
+            start_end = epoch_range_str.split('-')
+            start, end = int(start_end[0]), int(start_end[1])
+            if start <= epoch < end:
+                return (epoch - start) % frequency == 0
+        return True  # Default: validate every epoch
+
     # Step 4: training
     n_epochs = args.controlnet_train["n_epochs"]
     scaler = GradScaler("cuda")
     total_step = 0
-    best_loss = 1e4
+    best_val_loss = 1e4
 
     if weighted_loss > 1.0:
         logger.info(f"apply weighted loss = {weighted_loss} on labels: {weighted_loss_label}")
@@ -372,8 +531,9 @@ def train_controlnet(
     controlnet.train()
     unet.eval()
     prev_time = time.time()
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
         epoch_loss_ = 0
+        epoch_loss_history = []
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
             images = batch["image"].to(device) * scale_factor
@@ -463,12 +623,74 @@ def train_controlnet(
                 if weighted_loss > 1.0:
                     weights = torch.ones_like(images).to(images.device)
                     roi = torch.zeros([noise_shape[0]] + [1] + noise_shape[2:]).to(images.device)
-                    interpolate_label = F.interpolate(labels, size=images.shape[2:], mode="nearest")
+                    # Convert labels to float before interpolation (Long not supported by F.interpolate)
+                    interpolate_label = F.interpolate(labels.float(), size=images.shape[2:], mode="nearest")
+                    # Dilation to compensate VAE receptive field edge effects
+                    # kernel_size=5 provides 2-voxel dilation (~8mm physical space per side)
+                    interpolate_label = F.max_pool3d(
+                        interpolate_label.float(),
+                        kernel_size=5,
+                        stride=1,
+                        padding=2
+                    )
+                    interpolate_label = (interpolate_label > 0.5).float()  # Re-binarize
                     # assign larger weights for ROI (tumor)
                     for label in weighted_loss_label:
-                        roi[interpolate_label == label] = 1
+                        mask = (interpolate_label.squeeze(1) == label).unsqueeze(1)  # Add back channel dim
+                        roi[mask] = 1
                     weights[roi.repeat(1, images.shape[1], 1, 1, 1) == 1] = weighted_loss
-                    loss = (F.l1_loss(model_output.float(), model_gt.float(), reduction="none") * weights).mean()
+
+                    # Check if to use ROI Intensity Loss (Ibarra et al. strategy)
+                    use_roi_intensity = args.controlnet_train.get("use_roi_intensity_loss", False)
+                    roi_intensity_weight = args.controlnet_train.get("roi_intensity_weight", 1.0)
+
+                    # Global weighted L1 Loss (crucial: keeps background pure black!)
+                    l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
+                    loss_global = (l1_loss_raw * weights).mean()
+
+                    if use_roi_intensity:
+                        # ROI Intensity Loss from Ibarra et al. with Asymmetric Contrast
+                        # Use dilated mask as ROI (already computed above)
+                        roi_mask = (interpolate_label > 0.5)  # Boolean mask for tumor region
+
+                        # Ensure batch has tumor pixels to avoid NaN
+                        if roi_mask.sum() > 0:
+                            # Expand mask to match latent channels
+                            roi_mask_expanded = roi_mask.repeat(1, images.shape[1], 1, 1, 1)
+
+                            # Extract predictions and GT in ROI
+                            pred_roi = model_output.float()[roi_mask_expanded]
+                            gt_roi = model_gt.float()[roi_mask_expanded]
+
+                            # 1. Mean intensity constraint (macro-level regulation)
+                            # Keep L1 for mean matching (stable gradient for global brightness)
+                            loss_intensity = F.l1_loss(pred_roi.mean(), gt_roi.mean())
+
+                            # 2. MSE Contrast Loss - squared penalty on spatial distribution!
+                            # MSE heavily penalizes large errors: (1.0 - 0.1)^2 = 0.81 vs L1 = 0.9
+                            # Gradient: MSE gives 2*(pred-gt), stronger correction for outliers
+                            # This prevents model from "cheating" by spreading signal thinly
+                            loss_contrast = F.mse_loss(pred_roi, gt_roi)
+
+                            # Combined ROI loss with balanced weight on contrast
+                            # MSE already gives stronger gradients, reduce weight to 0.1
+                            loss_roi_total = loss_intensity + 0.1 * loss_contrast
+                        else:
+                            loss_roi_total = torch.tensor(0.0, device=model_output.device)
+
+                        loss = loss_global + roi_intensity_weight * loss_roi_total
+
+                        # Log individual loss components every 50 steps
+                        if total_step % 50 == 0:
+                            if isinstance(loss_roi_total, torch.Tensor):
+                                logger.info(f"  Loss Components - Global L1: {loss_global.item():.4f}, ROI Total: {loss_roi_total.item():.4f}, Combined: {loss.item():.4f}")
+                                tensorboard_writer.add_scalar("train/loss_roi_total", loss_roi_total.item(), total_step)
+                            else:
+                                logger.info(f"  Loss Components - Global L1: {loss_global.item():.4f}, ROI Total: 0.0000, Combined: {loss.item():.4f}")
+                            tensorboard_writer.add_scalar("train/loss_global", loss_global.item(), total_step)
+                    else:
+                        # Standard weighted L1 loss only
+                        loss = loss_global
                 else:
                     loss = F.l1_loss(model_output.float(), model_gt.float())
     
@@ -488,6 +710,17 @@ def train_controlnet(
                     loss += args.controlnet_train["region_contrasive_loss_weight"]*final_loss_region_contrasive
 
             scaler.scale(loss).backward()
+
+            # Gradient clipping to prevent numerical instability
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
+
+            # Verify gradient flow (first few steps only)
+            if total_step < 5:
+                unet_has_grad = any(p.grad is not None for p in unet.parameters())
+                if unet_has_grad:
+                    logger.warning("WARNING: DiT/U-Net has gradients! Check freezing logic.")
+
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step()
@@ -498,21 +731,19 @@ def train_controlnet(
                 tensorboard_writer.add_scalar(
                     "train/train_controlnet_loss_iter", loss.detach().cpu().item(), total_step
                 )
-                batches_done = step + 1
-                batches_left = len(train_loader) - batches_done
-                time_left = timedelta(seconds=batches_left * (time.time() - prev_time))
-                prev_time = time.time()
+
+            # Track loss history
+            epoch_loss_history.append(loss.detach().cpu().item())
+
+            # Log every 10 batches with rolling average
+            if rank == 0 and (step + 1) % 10 == 0:
+                recent_mean = np.mean(epoch_loss_history[-10:])
+                recent_std = np.std(epoch_loss_history[-10:])
                 logger.info(
-                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
-                    % (
-                        epoch + 1,
-                        n_epochs,
-                        step + 1,
-                        len(train_loader),
-                        lr_scheduler.get_last_lr()[0],
-                        loss.detach().cpu().item(),
-                        time_left,
-                    )
+                    f"[Epoch {epoch+1:3d}/{n_epochs}] "
+                    f"[Batch {step+1:3d}/{len(train_loader)}] "
+                    f"[LR: {lr_scheduler.get_last_lr()[0]:.2e}] "
+                    f"[Loss: {recent_mean:.4f} ±{recent_std:.2f}]"
                 )
             epoch_loss_ += loss.detach()
 
@@ -524,32 +755,170 @@ def train_controlnet(
 
         if rank == 0:
             tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
-            # save controlnet only on master GPU (rank 0)
+
+            # Get state dict once for all saves
             controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "loss": epoch_loss,
-                    "controlnet_state_dict": controlnet_state_dict,
-                },
-                f"{args.model_dir}/{args.exp_name}_current.pt",
-            )
-            logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_current.pt")
 
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                logger.info(f"best loss -> {best_loss}.")
-                torch.save(
-                    {
+            # Save epoch checkpoint (each epoch separately)
+            # Include UNet state dict if in fine-tuning mode
+            save_dict = {
+                "epoch": epoch + 1,
+                "train_loss": epoch_loss,
+                "controlnet_state_dict": controlnet_state_dict,
+            }
+
+            # Add fine-tuning metadata
+            if 'finetune_stage' in args.controlnet_train:
+                save_dict["unet_finetuned_state_dict"] = unet.state_dict()
+                save_dict["finetune_stage"] = args.controlnet_train.get("finetune_stage", 0)
+                save_dict["finetune_unfreeze_layers"] = args.controlnet_train.get("finetune_unfreeze_layers", [])
+                logger.info(f"Saving fine-tuned UNet ({len(save_dict['finetune_unfreeze_layers'])} layers)")
+
+            torch.save(save_dict, f"{args.model_dir}/{args.exp_name}_epoch_{epoch+1}.pt")
+            logger.info(f"Save epoch {epoch+1} model to {args.model_dir}/{args.exp_name}_epoch_{epoch+1}.pt")
+
+        # ==================== Validation Loop ====================
+        # Get validation schedule (default to every epoch)
+        val_schedule = args.controlnet_train.get('val_frequency_schedule', {'0-999': 1})
+
+        # Only validate if scheduled
+        if should_validate(epoch, val_schedule):
+            controlnet.eval()
+            val_loss_sum = 0.0
+            val_steps = 0
+
+            logger.info(f"Running validation on {len(val_loader)} batches...")
+
+            with torch.no_grad():
+                for val_step, val_batch in enumerate(val_loader):
+                    # Get validation data
+                    val_images = val_batch["image"].to(device) * scale_factor
+                    val_labels = val_batch["label"].to(device)
+                    val_pre_images = val_batch.get("pre", None)
+                    if val_pre_images is not None:
+                        val_pre_images = val_pre_images.to(device)
+
+                    val_spacing_tensor = val_batch["spacing"].to(device)
+                    val_top_region_index_tensor = None
+                    val_bottom_region_index_tensor = None
+                    val_modality_tensor = None
+
+                    if include_body_region:
+                        val_top_region_index_tensor = val_batch["top_region_index"].to(device)
+                        val_bottom_region_index_tensor = val_batch["bottom_region_index"].to(device)
+                    if include_modality:
+                        val_modality_tensor = val_batch["modality"].to(device)
+
+                    # Sample timesteps for validation (use fixed timesteps for consistency)
+                    if isinstance(noise_scheduler, RFlowScheduler):
+                        val_timesteps = noise_scheduler.sample_timesteps(val_images)
+                    else:
+                        val_timesteps = torch.randint(
+                            0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device
+                        ).long()
+
+                    # Sample noise
+                    val_noise = torch.randn(list(val_images.shape), dtype=val_images.dtype).to(device)
+
+                    # Compute model output
+                    with autocast("cuda", enabled=True):
+                        (val_model_output, _, _) = compute_model_output(
+                            val_images, val_labels, val_noise, val_timesteps, noise_scheduler,
+                            controlnet, unet,
+                            val_spacing_tensor,
+                            val_modality_tensor,
+                            val_top_region_index_tensor,
+                            val_bottom_region_index_tensor,
+                            pre_images=val_pre_images,
+                            return_controlnet_blocks=False
+                        )
+
+                        # Compute ground truth based on prediction type
+                        if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                            val_model_gt = val_noise
+                        elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                            val_model_gt = val_images
+                        elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
+                            val_model_gt = val_images - val_noise
+                        else:
+                            raise ValueError("Unknown prediction type")
+
+                        # Compute weighted loss (same as training)
+                        if weighted_loss > 1.0:
+                            val_weights = torch.ones_like(val_images).to(val_images.device)
+                            val_roi = torch.zeros([val_images.shape[0], 1, *val_images.shape[2:]], device=val_images.device)
+                            val_interpolate_label = F.interpolate(val_labels.float(), size=val_images.shape[2:], mode="nearest")
+                            val_interpolate_label = F.max_pool3d(
+                                val_interpolate_label.float(),
+                                kernel_size=5,
+                                stride=1,
+                                padding=2
+                            )
+                            val_interpolate_label = (val_interpolate_label > 0.5).float()
+                            for label in weighted_loss_label:
+                                val_mask = (val_interpolate_label.squeeze(1) == label).unsqueeze(1)
+                                val_roi[val_mask] = 1
+                            val_weights[val_roi.repeat(1, val_images.shape[1], 1, 1, 1) == 1] = weighted_loss
+                            val_loss = (F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none") * val_weights).mean()
+                        else:
+                            val_loss = F.l1_loss(val_model_output.float(), val_model_gt.float())
+
+                    # Check for NaN loss and skip this batch if detected
+                    loss_item = val_loss.detach().item()
+                    if not np.isnan(loss_item):
+                        val_loss_sum += loss_item
+                        val_steps += 1
+                    else:
+                        logger.warning(f"WARNING: NaN detected in validation batch {val_step}, skipping...")
+
+            # Compute average validation loss
+            if val_steps > 0:
+                avg_val_loss = val_loss_sum / val_steps
+            else:
+                avg_val_loss = 0.0
+
+            if use_ddp:
+                dist.barrier()
+                # Aggregate validation loss across GPUs
+                val_loss_tensor = torch.tensor([avg_val_loss], device=device)
+                dist.all_reduce(val_loss_tensor, op=torch.distributed.ReduceOp.AVG)
+                avg_val_loss = val_loss_tensor.item()
+
+            if rank == 0:
+                tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", avg_val_loss, total_step)
+                logger.info(f"Epoch {epoch + 1} - Train Loss: {epoch_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+                # Update best validation loss checkpoint
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    logger.info(f"*** New best validation loss -> {best_val_loss:.4f} ***")
+
+                    # Save best checkpoint with UNet if in fine-tuning mode
+                    save_dict = {
                         "epoch": epoch + 1,
-                        "loss": best_loss,
+                        "train_loss": epoch_loss,
+                        "val_loss": best_val_loss,
                         "controlnet_state_dict": controlnet_state_dict,
-                    },
-                    f"{args.model_dir}/{args.exp_name}_best.pt",
-                )
-                logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_best.pt")
+                    }
 
-        torch.cuda.empty_cache()
+                    if 'finetune_stage' in args.controlnet_train:
+                        save_dict["unet_finetuned_state_dict"] = unet.state_dict()
+                        save_dict["finetune_stage"] = args.controlnet_train.get("finetune_stage", 0)
+                        save_dict["finetune_unfreeze_layers"] = args.controlnet_train.get("finetune_unfreeze_layers", [])
+
+                    torch.save(save_dict, f"{args.model_dir}/{args.exp_name}_best.pt")
+                    logger.info(f"Save best validation model to {args.model_dir}/{args.exp_name}_best.pt")
+
+            # Set back to training mode
+            controlnet.train()
+            # Aggressive cache clearing after validation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        else:
+            logger.info(f"Skipping validation this epoch (scheduled)")
+            controlnet.train()
+            torch.cuda.empty_cache()
     if use_ddp:
         dist.destroy_process_group()
 

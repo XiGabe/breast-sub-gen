@@ -1,0 +1,27 @@
+{
+    "controlnet_train": {
+        "finetune_stage": 3,
+        "finetune_unfreeze_layers": ["up_blocks.0", "up_blocks.1", "up_blocks.2", "up_blocks.3", "middle_block"],
+        "finetune_controlnet_lr": 1e-4,
+        "finetune_unet_lr": 1e-5,
+        "batch_size": 4,
+        "cache_rate": 0.0,
+        "fold": 0,
+        "n_epochs": 130,
+        "weighted_loss": 10.0,
+        "weighted_loss_label": [1],
+        "max_grad_norm": 1.0,
+        "val_frequency_schedule": {
+            "107-130": 3
+        },
+        "use_gradient_checkpointing": true,
+        "use_roi_intensity_loss": true,
+        "roi_intensity_weight": 0.5
+    },
+    "controlnet_infer": {
+        "num_inference_steps": 20,
+        "autoencoder_sliding_window_infer_size": [320, 320, 160],
+        "autoencoder_sliding_window_infer_overlap": 0.4,
+        "modality": 9
+    }
+}

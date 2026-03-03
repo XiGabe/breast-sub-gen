@@ -1,18 +1,19 @@
 {
-    "data_base_dir": "./embeddings_breast_sub",
+    "data_base_dir": ".",
     "embedding_base_dir": "./embeddings_breast_sub",
     "pre_output_dir": "./processed_pre",
     "mask_output_dir": "./processed_mask",
     "json_data_list": "./dataset_breast_cached.json",
     "model_dir": "./weights",
-    "model_filename": "diff_unet_3d_breast_sub.pt",
-    "output_dir": "./output_breast_sub",
-    "output_prefix": "breast_sub",
+    "model_filename": "breast_sub_controlnet_finetune_s2_5.pt",
+    "output_dir": "./output_breast_sub_finetune_s2_5",
+    "output_prefix": "breast_sub_finetune_s2_5",
     "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
-    "existing_ckpt_filepath": "./weights/breast_sub_controlnet_epoch_55.pt",
+    "existing_ckpt_filepath": "./weights/breast_sub_controlnet_finetune_s2_epoch_100.pt",
     "modality_mapping_path": "./configs/modality_mapping.json",
     "tfevent_path": "./tensorboard_logs",
-    "exp_name": "breast_sub_controlnet",
+    "exp_name": "breast_sub_controlnet_finetune_s2_5_topk",
     "trained_diffusion_path": "./weights/diff_unet_3d_rflow-mr.pt",
-    "modality": "mri"
+    "modality": "mri",
+    "use_region_contrasive_loss": false
 }

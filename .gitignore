@@ -18,7 +18,9 @@ dist/
 # 显式忽略你的权重文件夹
 # 忽略 MAISI 官方下载的权重
 models/*.pt
-
+*.png
+*.err
+*.0
 # --- 3. 医学影像数据 (核心：隐私与体积) ---
 # 忽略所有 NIfTI 图像数据
 *.nii
@@ -35,6 +37,7 @@ embeddings*/
 .idea/
 *.log
 *.csv
+.nfs000000001c3092ed000587e3
 # --- 6. 配置文件例外 (可选) ---
 # 如果你有包含私密 Token 的 JSON，可以加在这里
 # 但是你的 config_maisi_vae_train.json 通常是需要同步的，所以不忽略
