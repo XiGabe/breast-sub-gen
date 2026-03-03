@@ -1,0 +1,9 @@
+*.nii.gz
+*.log
+*.err
+*.png
+*.0
+*.pyc
+.nfs000000001c3092ed000587e3
+*.pt
+*.csv
