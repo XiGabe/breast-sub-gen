@@ -228,6 +228,11 @@ def compute_model_output(
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
 
+    # CRITICAL FIX for Stage 4: Clone noisy_latent to prevent memory sharing
+    # noise_scheduler.add_noise may create a view that shares memory with 'images'.
+    # When down_blocks.2,3 are unfrozen, this shared memory causes inplace operation errors.
+    noisy_latent = noisy_latent.clone()
+
     # get controlnet output
     # Create a dictionary to store the inputs
     controlnet_inputs = {
@@ -242,6 +247,12 @@ def compute_model_output(
             }
         )
     down_block_res_samples, mid_block_res_sample = controlnet(**controlnet_inputs)
+
+    # Clone residuals to avoid inplace operation issues when deep encoder is unfrozen
+    # This prevents MAISI UNet's internal inplace ops (e.g., ReLU) from breaking the grad graph
+    down_block_res_samples = [r.clone() if r is not None else None for r in down_block_res_samples]
+    if mid_block_res_sample is not None:
+        mid_block_res_sample = mid_block_res_sample.clone()
 
     # get diffusion network output
     # Create a dictionary to store the inputs
@@ -266,7 +277,21 @@ def compute_model_output(
                 "class_labels": modality_tensor,
             }
         )
-    model_output = unet(**unet_inputs)
+
+    # UNet forward pass with gradient checkpointing for Stage 4
+    # When down_blocks.2,3 are unfrozen, UNet's internal inplace ops corrupt the gradient graph.
+    # Gradient checkpointing recomputes forward pass during backward, avoiding saving problematic intermediates.
+    def create_unet_forward_func(unet_inputs_dict):
+        """Closure to capture unet_inputs for checkpoint"""
+        def forward_func():
+            return unet(**unet_inputs_dict)
+        return forward_func
+
+    # Use checkpointing to avoid saving intermediate activations that get modified
+    model_output = torch.utils.checkpoint.checkpoint(
+        create_unet_forward_func(unet_inputs),
+        use_reentrant=False,
+    )
     if return_controlnet_blocks:
         return model_output, down_block_res_samples, mid_block_res_sample
     else:
@@ -394,6 +419,29 @@ def train_controlnet(
 
     if unet_trainable > 0:
         raise ValueError("ERROR: DiT/U-Net has trainable parameters! Check freezing logic.")
+
+    # Critical fix for Stage 4: Disable inplace operations when deep encoder is unfrozen
+    def disable_inplace_recursive(module, name="root"):
+        """Recursively disable inplace operations to prevent gradient graph corruption."""
+        count = 0
+        for child_name, child in module.named_children():
+            full_name = f"{name}.{child_name}"
+            if hasattr(child, 'inplace') and child.inplace:
+                child.inplace = False
+                logger.info(f"  Disabled inplace: {full_name} ({type(child).__name__})")
+                count += 1
+            count += disable_inplace_recursive(child, full_name)
+        return count
+
+    # Check if we're unfreezing deep encoder (Stage 4)
+    unfreeze_layers = args.controlnet_train.get('finetune_unfreeze_layers', [])
+    has_deep_encoder = any('down_blocks.2' in name or 'down_blocks.3' in name for name in unfreeze_layers)
+
+    if has_deep_encoder:
+        logger.info("=== Stage 4 Detected: Disabling inplace operations ===")
+        unet_count = disable_inplace_recursive(unet, "unet")
+        controlnet_count = disable_inplace_recursive(controlnet, "controlnet")
+        logger.info(f"Total inplace ops disabled: UNet={unet_count}, ControlNet={controlnet_count}")
 
     # Fine-tuning mode: selectively unfreeze U-Net layers if configured
     def unfreeze_unet_layers(unet, layer_names):
@@ -644,6 +692,10 @@ def train_controlnet(
                     use_roi_intensity = args.controlnet_train.get("use_roi_intensity_loss", False)
                     roi_intensity_weight = args.controlnet_train.get("roi_intensity_weight", 1.0)
 
+                    # Check if to use Background False Positive Penalty (Hard Negative Mining)
+                    use_bg_penalty = args.controlnet_train.get("use_bg_penalty", False)
+                    bg_penalty_weight = args.controlnet_train.get("bg_penalty_weight", 5.0)
+
                     # Global weighted L1 Loss (crucial: keeps background pure black!)
                     l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
                     loss_global = (l1_loss_raw * weights).mean()
@@ -680,11 +732,37 @@ def train_controlnet(
 
                         loss = loss_global + roi_intensity_weight * loss_roi_total
 
+                        # Background False Positive Penalty (Hard Negative Mining)
+                        # Asymmetric penalty: ONLY punish background pixels that are "too white" (pred > gt)
+                        if use_bg_penalty and roi_mask.sum() > 0:
+                            # Background region is where GT label is 0
+                            bg_mask_expanded = (~roi_mask).repeat(1, images.shape[1], 1, 1, 1)
+                            pred_bg = model_output.float()[bg_mask_expanded]
+                            gt_bg = model_gt.float()[bg_mask_expanded]
+
+                            # F.relu ensures we ONLY punish pred > gt (false positives), not pred < gt
+                            # This is asymmetric: under-prediction in background is OK, over-prediction is BAD
+                            false_positive_bg = F.relu(pred_bg - gt_bg)
+
+                            # Squared penalty: larger errors get exponentially harsher punishment
+                            # pred=0.01 when gt=0: penalty=0.0001 (negligible)
+                            # pred=0.10 when gt=0: penalty=0.0100 (10x worse)
+                            # pred=0.30 when gt=0: penalty=0.0900 (900x worse!)
+                            loss_bg_penalty = (false_positive_bg ** 2).mean()
+
+                            loss = loss + bg_penalty_weight * loss_bg_penalty
+
                         # Log individual loss components every 50 steps
                         if total_step % 50 == 0:
                             if isinstance(loss_roi_total, torch.Tensor):
-                                logger.info(f"  Loss Components - Global L1: {loss_global.item():.4f}, ROI Total: {loss_roi_total.item():.4f}, Combined: {loss.item():.4f}")
+                                log_msg = f"  Loss Components - Global L1: {loss_global.item():.4f}, ROI Total: {loss_roi_total.item():.4f}"
+                                if use_bg_penalty and 'loss_bg_penalty' in locals():
+                                    log_msg += f", BG Penalty: {loss_bg_penalty.item():.4f}"
+                                log_msg += f", Combined: {loss.item():.4f}"
+                                logger.info(log_msg)
                                 tensorboard_writer.add_scalar("train/loss_roi_total", loss_roi_total.item(), total_step)
+                                if use_bg_penalty and 'loss_bg_penalty' in locals():
+                                    tensorboard_writer.add_scalar("train/loss_bg_penalty", loss_bg_penalty.item(), total_step)
                             else:
                                 logger.info(f"  Loss Components - Global L1: {loss_global.item():.4f}, ROI Total: 0.0000, Combined: {loss.item():.4f}")
                             tensorboard_writer.add_scalar("train/loss_global", loss_global.item(), total_step)

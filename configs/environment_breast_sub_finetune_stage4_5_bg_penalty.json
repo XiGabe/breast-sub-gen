@@ -1,0 +1,19 @@
+{
+    "data_base_dir": ".",
+    "embedding_base_dir": "./embeddings_breast_sub",
+    "pre_output_dir": "./processed_pre",
+    "mask_output_dir": "./processed_mask",
+    "json_data_list": "./dataset_breast_cached.json",
+    "model_dir": "./weights",
+    "model_filename": "breast_sub_controlnet_best.pt",
+    "output_dir": "./output_breast_sub_finetune_s4_5_bg_penalty",
+    "output_prefix": "breast_sub_finetune_s4_5_bg_penalty",
+    "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
+    "existing_ckpt_filepath": "./weights/breast_sub_finetune_s4_5_epoch_147.pt",
+    "trained_controlnet_path": "./weights/breast_sub_finetune_s4_5_epoch_147.pt",
+    "modality_mapping_path": "./configs/modality_mapping.json",
+    "tfevent_path": "./tensorboard_logs",
+    "exp_name": "breast_sub_finetune_s4_5_bg_penalty",
+    "trained_diffusion_path": "./weights/diff_unet_3d_rflow-mr.pt",
+    "modality": "mri"
+}

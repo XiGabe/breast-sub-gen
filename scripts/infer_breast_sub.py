@@ -65,7 +65,7 @@ def infer_breast_sub(
     unet.load_state_dict(ckpt_unet["unet_state_dict"], strict=False)
     scale_factor = ckpt_unet["scale_factor"].to(device)
     unet.eval()
-    logger.info(f"  Diffusion UNet: {env_args.trained_diffusion_path}")
+    logger.info(f"  Diffusion UNet (base): {env_args.trained_diffusion_path}")
     logger.info(f"  Scale factor: {scale_factor.item():.6f}")
 
     # 3. ControlNet
@@ -76,6 +76,20 @@ def infer_breast_sub(
     controlnet.load_state_dict(ckpt_controlnet["controlnet_state_dict"], strict=False)
     controlnet.eval()
     logger.info(f"  ControlNet: {env_args.existing_ckpt_filepath}")
+
+    # 3.5. Load finetuned UNet state if available (important for Stage 3+!)
+    if "unet_finetuned_state_dict" in ckpt_controlnet:
+        unet_finetuned = ckpt_controlnet["unet_finetuned_state_dict"]
+        # Load with strict=False to only update matching keys (finetuned layers)
+        missing, unexpected = unet.load_state_dict(unet_finetuned, strict=False)
+        logger.info(f"  Loaded finetuned UNet state: {len(unet_finetuned)} parameters")
+        if missing:
+            logger.info(f"    Missing keys: {len(missing)}")
+        if unexpected:
+            logger.info(f"    Unexpected keys: {len(unexpected)}")
+        finetune_stage = ckpt_controlnet.get("finetune_stage", "unknown")
+        finetune_layers = ckpt_controlnet.get("finetune_unfreeze_layers", [])
+        logger.info(f"  Finetune Stage: {finetune_stage}, Unfrozen: {finetune_layers}")
 
     # 4. Scheduler
     noise_scheduler = define_instance(env_args, "noise_scheduler")
@@ -201,6 +215,7 @@ def infer_breast_sub(
         pred_sub_np = np.clip(pred_sub_np, 0, 1)
 
         # Invert: model predicts inverted subtraction
+        # Verified: removing inversion results in negative correlation (-0.40)
         pred_sub_np = 1.0 - pred_sub_np
 
         # Save output
