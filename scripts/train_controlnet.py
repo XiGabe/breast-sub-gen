@@ -89,6 +89,78 @@ def apply_random_morphological_perturbation(masks):
 
     return torch.cat(masks_perturbed, dim=0)
 
+def set_unet_frozen_state(unet, blocks_to_unfreeze=None, disable_inplace=False):
+    """
+    Freeze or unfreeze specific U-Net blocks for progressive training.
+
+    This function enables staged fine-tuning of the U-Net by selectively unfreezing
+    specific blocks while keeping others frozen. This is critical for the progressive
+    co-tuning strategy where ControlNet is trained first, then deep U-Net blocks,
+    and finally shallow U-Net blocks.
+
+    Args:
+        unet: The U-Net model (DDP wrapped or unwrapped).
+        blocks_to_unfreeze: List of block prefixes to unfreeze (e.g., ['down_blocks.2']).
+            If None or empty, all blocks are frozen.
+        disable_inplace: If True, recursively disable inplace operations on all modules.
+            This is CRITICAL when using gradient checkpointing with mixed frozen/unfrozen
+            blocks to avoid RuntimeError: "one of the variables needed for gradient
+            computation has been modified by an inplace operation."
+
+    Block naming structure:
+        Shallow encoder: 'down_blocks.0', 'down_blocks.1'
+        Deep encoder: 'down_blocks.2', 'down_blocks.3'
+        Bridge: 'middle_block'
+        Deep decoder: 'up_blocks.0', 'up_blocks.1', 'up_blocks.2', 'up_blocks.3'
+        Shallow decoder: 'up_blocks.3'
+
+    Permanently frozen blocks (non-spatial features):
+        'conv_in', 'class_embedding', 'time_embed'
+
+    Returns:
+        tuple: (unfrozen_count, total_count) - Number of unfrozen parameters and total parameters.
+
+    Example:
+        # Stage 3.1: ControlNet only (all U-Net frozen)
+        set_unet_frozen_state(unet)
+
+        # Stage 3.2: Deep blocks
+        set_unet_frozen_state(unet, blocks_to_unfreeze=[
+            'down_blocks.2', 'down_blocks.3', 'middle_block',
+            'up_blocks.0', 'up_blocks.1', 'up_blocks.2', 'up_blocks.3'
+        ], disable_inplace=True)
+
+        # Stage 3.3: All blocks
+        set_unet_frozen_state(unet, blocks_to_unfreeze=[
+            'down_blocks.0', 'down_blocks.1', 'down_blocks.2', 'down_blocks.3',
+            'middle_block',
+            'up_blocks.0', 'up_blocks.1', 'up_blocks.2', 'up_blocks.3'
+        ], disable_inplace=True)
+    """
+    if blocks_to_unfreeze is None:
+        blocks_to_unfreeze = []
+
+    # Always keep these frozen (non-spatial features that should remain fixed)
+    frozen_blocks = ['conv_in', 'class_embedding', 'time_embed']
+
+    # Disable inplace operations if requested (CRITICAL for gradient checkpointing + mixed frozen/unfrozen)
+    if disable_inplace:
+        for module in unet.modules():
+            if hasattr(module, 'inplace') and module.inplace:
+                module.inplace = False
+
+    for name, param in unet.named_parameters():
+        # Check if this parameter belongs to a block we want to unfreeze
+        should_unfreeze = any(name.startswith(block) for block in blocks_to_unfreeze)
+        # Check if this parameter belongs to a permanently frozen block
+        should_freeze = any(name.startswith(block) for block in frozen_blocks)
+        # Set requires_grad: True only if unfreezing AND not in permanently frozen blocks
+        param.requires_grad = should_unfreeze and not should_freeze
+
+    unfrozen_count = sum(p.requires_grad for p in unet.parameters())
+    total_count = sum(1 for p in unet.parameters())
+    return unfrozen_count, total_count
+
 def compute_model_output(
     images,labels,noise,timesteps,noise_scheduler,
     controlnet,unet,
@@ -286,16 +358,41 @@ def train_controlnet(
     # load trained controlnet model if it is provided
     if args.existing_ckpt_filepath is not None:
         if not os.path.exists(args.existing_ckpt_filepath):
-            raise ValueError("Please download the trained ControlNet checkpoint.")
-        controlnet.load_state_dict(
-            torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)["controlnet_state_dict"]
-        )
-        logger.info(f"load trained controlnet model from {args.existing_ckpt_filepath}")
+            raise ValueError(f"Please check if {args.existing_ckpt_filepath} exists.")
+        checkpoint = torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)
+
+        # Load ControlNet
+        controlnet.load_state_dict(checkpoint["controlnet_state_dict"])
+        logger.info(f"Loaded ControlNet from {args.existing_ckpt_filepath}")
+
+        # Load U-Net if available (from Stage 2 or 3)
+        if "unet_state_dict" in checkpoint and checkpoint["unet_state_dict"] is not None:
+            unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
+            logger.info("Loaded fine-tuned U-Net state from checkpoint")
+        else:
+            logger.info("No U-Net state in checkpoint (using base pretrained U-Net)")
     else:
         logger.info("train controlnet model from scratch.")
-    # we freeze the parameters of the diffusion model.
-    for p in unet.parameters():
-        p.requires_grad = False
+
+    # Freeze/unfreeze U-Net blocks based on config for progressive training
+    unet_blocks_to_unfreeze = args.controlnet_train.get("unet_blocks_to_unfreeze", [])
+    disable_inplace = args.controlnet_train.get("disable_inplace_for_checkpointing", False)
+
+    if unet_blocks_to_unfreeze:
+        unfrozen_count, total_count = set_unet_frozen_state(
+            unet,
+            blocks_to_unfreeze=unet_blocks_to_unfreeze,
+            disable_inplace=disable_inplace
+        )
+        logger.info(f"U-Net progressive training: {unfrozen_count}/{total_count} parameters unfrozen")
+        logger.info(f"Unfrozen blocks: {unet_blocks_to_unfreeze}")
+        if disable_inplace:
+            logger.info("Inplace operations disabled for gradient checkpointing compatibility")
+    else:
+        # Default: freeze all U-Net parameters (Stage 3.1: ControlNet only)
+        for p in unet.parameters():
+            p.requires_grad = False
+        logger.info("U-Net fully frozen (Stage 3.1: ControlNet only)")
 
     noise_scheduler = define_instance(args, "noise_scheduler")
 
@@ -314,7 +411,7 @@ def train_controlnet(
     else:
         args.modality_mapping = None
 
-    train_loader, _ = prepare_maisi_controlnet_json_dataloader(
+    train_loader, val_loader = prepare_maisi_controlnet_json_dataloader(
         json_data_list=args.json_data_list,
         data_base_dir=args.data_base_dir,
         rank=rank,
@@ -325,8 +422,29 @@ def train_controlnet(
         modality_mapping = args.modality_mapping
     )
 
-    # Step 3: training config
-    optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
+    # Validation settings
+    validation_enabled = val_loader is not None
+    validation_freq = args.controlnet_train.get("validation_frequency", 1)  # Validate every N epochs
+    if validation_enabled:
+        logger.info(f"Validation enabled: every {validation_freq} epoch(s)")
+    else:
+        logger.info("No validation set - using training loss for checkpoint selection")
+
+    # Step 3: training config with dual learning rate support
+    # Create optimizer with optional U-Net parameter group
+    params = [{"params": controlnet.parameters(), "lr": args.controlnet_train["lr"]}]
+
+    # Add U-Net parameters if any are unfrozen
+    unet_lr = args.controlnet_train.get("unet_lr", None)
+    if unet_lr and any(p.requires_grad for p in unet.parameters()):
+        # Get unfrozen U-Net parameters
+        unet_params = [p for p in unet.parameters() if p.requires_grad]
+        params.append({"params": unet_params, "lr": unet_lr})
+        logger.info(f"Two-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}, U-Net LR={unet_lr:.2e}")
+    else:
+        logger.info(f"Single-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}")
+
+    optimizer = torch.optim.AdamW(params)
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
 
@@ -525,30 +643,118 @@ def train_controlnet(
 
         if rank == 0:
             tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
-            # save controlnet only on master GPU (rank 0)
+
+            # Validation loop (if enabled)
+            val_loss = None
+            if validation_enabled and val_loader is not None and (epoch + 1) % validation_freq == 0:
+                logger.info(f"Running validation at epoch {epoch + 1}...")
+                controlnet.eval()
+                val_loss_ = 0
+                val_valid_batches = 0
+
+                with torch.no_grad():
+                    for val_step, val_batch in enumerate(val_loader):
+                        val_images = val_batch["image"].to(device) * scale_factor
+                        val_labels = val_batch["label"].to(device)
+                        val_spacing_tensor = val_batch["spacing"].to(device)
+                        val_pre_images = val_batch["pre"].to(device)
+                        val_modality_tensor = val_batch["modality"].to(device) if include_modality else None
+
+                        val_noise = torch.randn_like(val_images)
+                        if isinstance(noise_scheduler, RFlowScheduler):
+                            val_timesteps = noise_scheduler.sample_timesteps(val_images)
+                        else:
+                            val_timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device).long()
+
+                        with autocast("cuda", enabled=True):
+                            val_model_output, _, _ = compute_model_output(
+                                val_images, val_labels, val_noise, val_timesteps, noise_scheduler,
+                                controlnet, unet, val_spacing_tensor,
+                                pre_images=val_pre_images,
+                                apply_morphological_perturb=False,  # No augmentation during validation
+                                modality_tensor=val_modality_tensor,
+                            )
+
+                            if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                                val_model_gt = val_noise
+                            elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                                val_model_gt = val_images
+                            elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
+                                val_model_gt = val_images - val_noise
+                            else:
+                                raise ValueError(f"Unknown prediction type: {noise_scheduler.prediction_type}")
+
+                            # Same loss computation as training
+                            val_roi_mask_latent = F.max_pool3d(val_labels.float(), kernel_size=4, stride=4) > 0.0
+                            val_weights = torch.ones_like(val_model_output)
+                            val_weights[val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)] = 3.0
+                            val_l1_loss_raw = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
+                            val_loss = (val_l1_loss_raw * val_weights).mean()
+
+                            if val_roi_mask_latent.sum() > 0:
+                                val_bg_mask_expanded = (~val_roi_mask_latent).repeat(1, val_model_output.shape[1], 1, 1, 1)
+                            else:
+                                val_bg_mask_expanded = torch.ones_like(val_model_output, dtype=torch.bool)
+
+                            val_pred_bg = val_model_output.float()[val_bg_mask_expanded]
+                            val_gt_bg = val_model_gt.float()[val_bg_mask_expanded]
+                            val_false_positive_bg = F.relu(val_pred_bg - val_gt_bg)
+                            val_loss = val_loss + 5.0 * (val_false_positive_bg ** 2).mean()
+
+                        if not torch.isnan(val_loss):
+                            val_loss_ += val_loss.detach()
+                            val_valid_batches += 1
+
+                if val_valid_batches > 0:
+                    val_loss = val_loss_ / val_valid_batches
+                    logger.info(f"[Epoch {epoch + 1}] Validation loss: {val_loss:.4f}")
+                    tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", val_loss.cpu().item(), total_step)
+                else:
+                    logger.warning(f"[Epoch {epoch + 1}] All validation batches skipped!")
+                    val_loss = None
+
+                controlnet.train()
+
+            # Save checkpoint for this epoch
             controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
+
+            # Save U-Net state if any blocks are unfrozen
+            unet_state_dict = None
+            if any(p.requires_grad for p in unet.parameters()):
+                unet_state_dict = unet.module.state_dict() if world_size > 1 else unet.state_dict()
+
+            # Save per-epoch checkpoint
+            epoch_checkpoint_path = f"{args.model_dir}/{args.exp_name}_epoch_{epoch + 1}.pt"
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "loss": epoch_loss,
+                    "train_loss": epoch_loss,
+                    "val_loss": val_loss,
                     "controlnet_state_dict": controlnet_state_dict,
+                    "unet_state_dict": unet_state_dict,
+                    "scale_factor": scale_factor,
                 },
-                f"{args.model_dir}/{args.exp_name}_current.pt",
+                epoch_checkpoint_path,
             )
-            logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_current.pt")
+            logger.info(f"Saved epoch {epoch + 1} checkpoint to {epoch_checkpoint_path}")
 
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                logger.info(f"best loss -> {best_loss}.")
+            # Update best checkpoint based on validation loss (if available) or training loss
+            loss_for_best = val_loss if val_loss is not None else epoch_loss
+            if loss_for_best < best_loss:
+                best_loss = loss_for_best
+                best_checkpoint_path = f"{args.model_dir}/{args.exp_name}_best.pt"
                 torch.save(
                     {
                         "epoch": epoch + 1,
-                        "loss": best_loss,
+                        "train_loss": epoch_loss,
+                        "val_loss": val_loss,
                         "controlnet_state_dict": controlnet_state_dict,
+                        "unet_state_dict": unet_state_dict,
+                        "scale_factor": scale_factor,
                     },
-                    f"{args.model_dir}/{args.exp_name}_best.pt",
+                    best_checkpoint_path,
                 )
-                logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_best.pt")
+                logger.info(f"New best {'validation' if val_loss is not None else 'training'} loss: {best_loss:.4f} -> {best_checkpoint_path}")
 
         torch.cuda.empty_cache()
     if use_ddp:

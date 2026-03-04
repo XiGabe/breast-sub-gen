@@ -106,6 +106,19 @@ Key parameters in `config_network_rflow.json`:
 
 ## Training Commands
 
+### Progressive Training (Recommended)
+
+```bash
+# Stage 3.1: ControlNet only (50 epochs)
+sbatch scripts/submit_stage1.sh
+
+# Stage 3.2: Deep U-Net blocks (50 epochs)
+sbatch scripts/submit_stage2.sh
+
+# Stage 3.3: All U-Net blocks (50 epochs)
+sbatch scripts/submit_stage3.sh
+```
+
 ### Single GPU Training
 
 ```bash
@@ -124,17 +137,6 @@ python -m scripts.train_controlnet \
     --model_config_path configs/config_maisi_controlnet_train_rflow-mr.json \
     --model_def_path configs/config_network_rflow.json \
     --num_gpus 4
-```
-
-### Or using torchrun wrapper (from `diff_model_setting.py`)
-
-```python
-from scripts.diff_model_setting import run_torchrun
-run_torchrun(
-    "scripts.train_controlnet",
-    ["--env_config_path", "configs/environment_...", ...],
-    num_gpus=4
-)
 ```
 
 ---
@@ -224,20 +226,22 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 
 ## Training Strategy: Progressive Co-Tuning
 
-### Stage 3.1: ControlNet Alignment (Epoch 0-50)
-- U-Net: Frozen
-- ControlNet LR: 1e-4
-- Goal: Learn dual-channel conditioning
+Uses **shell script stages** to avoid optimizer momentum loss. Each stage creates a fresh optimizer.
 
-### Stage 3.2: Deep Semantic Release (Epoch 50-100)
-- Unfreeze: `down_blocks.2`, `down_blocks.3`, `middle_block`, `up_blocks`
-- U-Net LR: 5e-5
-- Goal: Fix brightness issues
+### Stage 3.1: ControlNet Alignment
+- U-Net: Frozen | LR: 1e-4 | Epochs: 50
+- Config: `config_maisi_controlnet_train_stage1.json`
+- Output: `models/breast_controlnet_stage1_best.pt`
 
-### Stage 3.3: Shallow Edge Refinement (Epoch 100-150)
-- Unfreeze: All U-Net blocks
-- U-Net LR: 1e-5
-- Goal: Generate realistic heterogeneity
+### Stage 3.2: Deep Semantic Release
+- Unfreeze: Deep blocks (`down_blocks.2`, `down_blocks.3`, `middle_block`, `up_blocks`)
+- U-Net LR: 5e-5 | Epochs: 50 | Inplace disabled
+- Output: `models/breast_controlnet_stage2_best.pt`
+
+### Stage 3.3: Shallow Edge Refinement
+- Unfreeze: All blocks
+- U-Net LR: 1e-5 | Epochs: 50
+- Output: `models/breast_controlnet_stage3_best.pt`
 
 ---
 

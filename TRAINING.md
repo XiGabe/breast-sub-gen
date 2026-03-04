@@ -19,7 +19,7 @@
 - [x] Diffusion U-Net权重加载 (weights/diff_unet_3d_rflow-mr.pt)
 - [x] **阶段零完成**：基础设施与安全防雷
 - [x] **阶段二完成**：网络重构与极简 Loss 大清洗
-- [ ] **阶段三进行中**：MAISI 高保真渲染器渐进式微调
+- [x] **阶段三完成**：MAISI 高保真渲染器渐进式微调 (Shell Script 分阶段方案)
 
 ---
 
@@ -106,22 +106,34 @@ false_positive_bg = F.relu(pred_bg - gt_bg)  # 仅惩罚 pred > gt
 loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 ```
 
-### ⏳ 阶段三：MAISI 高保真渲染器渐进式微调
+### ✅ 阶段三：MAISI 高保真渲染器渐进式微调 (已完成)
 
-#### Stage 3.1: ControlNet 独立对齐期 (Epoch 0 - 50)
-- [ ] 目标：U-Net 全冻结。ControlNet 专心学双通道映射。
-- [ ] 解冻：U-Net `[]` (全部冻结)
-- [ ] 超参：ControlNet LR `1e-4`, U-Net LR `0.0`, Batch `4`
+**设计决策**: Shell 脚本分阶段（避免优化器重建导致的动量丢失）
 
-#### Stage 3.2: 深层语义放行期 (Epoch 50 - 100)
-- [ ] 目标：解决亮度不足（均值稀释）。解冻深层特征路由，释放高光异常值。
-- [ ] 解冻：U-Net `["down_blocks.2", "down_blocks.3", "middle_block", "up_blocks..."]`
-- [ ] 超参：U-Net LR `5e-5`, Batch `4`, 开启 `gradient_checkpointing`
+#### Stage 3.1: ControlNet 独立对齐期 (50 epochs)
+- [x] 目标：U-Net 全冻结。ControlNet 专心学双通道映射。
+- [x] 配置：`configs/config_maisi_controlnet_train_stage1.json`
+- [x] 脚本：`scripts/submit_stage1.sh`
+- [x] 超参：ControlNet LR `1e-4`, U-Net 全冻结
 
-#### Stage 3.3: 浅层边缘精雕期 (Epoch 100 - 150)
-- [ ] 目标：解决边缘模糊，生成逼真异质性强化。
-- [ ] 解冻：U-Net 全解冻（增加 `down_blocks.0`, `down_blocks.1`）
-- [ ] 超参：U-Net LR `1e-5` (极度保守)，Batch `4`
+#### Stage 3.2: 深层语义放行期 (50 epochs)
+- [x] 目标：解决亮度不足。解冻深层特征路由，释放高光异常值。
+- [x] 配置：`configs/config_maisi_controlnet_train_stage2.json`
+- [x] 脚本：`scripts/submit_stage2.sh`
+- [x] 超参：U-Net LR `5e-5`, 解冻 `down_blocks.2`, `down_blocks.3`, `middle_block`, `up_blocks`
+
+#### Stage 3.3: 浅层边缘精雕期 (50 epochs)
+- [x] 目标：解决边缘模糊，生成逼真异质性强化。
+- [x] 配置：`configs/config_maisi_controlnet_train_stage3.json`
+- [x] 脚本：`scripts/submit_stage3.sh`
+- [x] 超参：U-Net LR `1e-5`, 全部 U-Net 块解冻
+
+**使用方式**:
+```bash
+sbatch scripts/submit_stage1.sh  # Stage 1
+sbatch scripts/submit_stage2.sh  # Stage 2 (依赖 stage1_best.pt)
+sbatch scripts/submit_stage3.sh  # Stage 3 (依赖 stage2_best.pt)
+```
 
 ### 阶段四：全自动临床推理闭环
 
@@ -179,7 +191,7 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 ```json
 {
   "controlnet_train": {
-    "batch_size": 2,
+    "batch_size": 4,
     "cache_rate": 0.0,
     "fold": 0,
     "lr": 1e-4,
@@ -261,6 +273,25 @@ tensorboard --logdir outputs/tfevent
 ---
 
 ## 修改日志 (Modification Log)
+
+### 2026-03-04 - Stage 3 渐进式微调实现 (Shell Script 分阶段方案)
+
+**Completed Tasks**:
+- ✅ `set_unet_frozen_state()` 函数：选择性冻结/解冻 U-Net 块
+- ✅ 配置驱动：`unet_blocks_to_unfreeze`, `unet_lr`, `disable_inplace_for_checkpointing`
+- ✅ 双学习率优化器：ControlNet 和 U-Net 独立 LR
+- ✅ Checkpoint 保存/加载：支持 U-Net state_dict
+- ✅ 推理脚本更新：`infer_controlnet.py` 加载微调 U-Net
+- ✅ 3 个 Stage 配置文件 + 3 个提交脚本
+
+**Files Created**:
+- `configs/config_maisi_controlnet_train_stage{1,2,3}.json`
+- `configs/environment_maisi_controlnet_train_rflow-mr_breast_stage{1,2,3}.json`
+- `scripts/submit_stage{1,2,3}.sh`
+
+**Files Modified**:
+- `scripts/train_controlnet.py`: U-Net 冻结/解冻, 双 LR, Checkpoint 管理
+- `scripts/infer_controlnet.py`: 加载微调 U-Net
 
 ### 2026-03-04 - NaN Loss 自动跳过机制
 

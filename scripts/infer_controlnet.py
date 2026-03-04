@@ -78,6 +78,13 @@ def infer_controlnet(
     controlnet.load_state_dict(checkpoint_controlnet["controlnet_state_dict"], strict=False)
     logger.info(f"Load trained controlnet model from {args.trained_controlnet_path}.")
 
+    # Load fine-tuned U-Net if available (from Stage 2 or 3)
+    if "unet_state_dict" in checkpoint_controlnet and checkpoint_controlnet["unet_state_dict"] is not None:
+        unet.load_state_dict(checkpoint_controlnet["unet_state_dict"], strict=False)
+        logger.info("Loaded fine-tuned U-Net from ControlNet checkpoint")
+    else:
+        logger.info("Using base pretrained U-Net (no fine-tuning)")
+
     noise_scheduler = define_instance(args, "noise_scheduler")
 
     # set data loader
