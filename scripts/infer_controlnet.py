@@ -110,8 +110,9 @@ def infer_controlnet(
     unet.eval()
 
     for batch in val_loader:
-        # get label mask
+        # get label mask and pre-contrast images
         labels = batch["label"].to(device)
+        pre_images = batch["pre"].to(device)  # [B, 1, 256, 256, 256]
         # get corresponding conditions
         if include_body_region:
             top_region_index_tensor = batch["top_region_index"].to(device)
@@ -136,6 +137,7 @@ def infer_controlnet(
             scale_factor=scale_factor,
             device=device,
             combine_label_or=labels,
+            pre_images_or=pre_images,  # Pass pre-contrast images for dual-channel condition
             top_region_index_tensor=top_region_index_tensor,
             bottom_region_index_tensor=bottom_region_index_tensor,
             spacing_tensor=spacing_tensor,

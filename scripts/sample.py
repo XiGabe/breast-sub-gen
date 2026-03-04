@@ -33,7 +33,6 @@ from .augmentation import augmentation, remove_tumors
 from .find_masks import find_masks
 from .quality_check import is_outlier
 from .utils import (
-    binarize_labels,
     general_mask_generation_post_process,
     get_body_region_index_from_mask,
     remap_labels,
@@ -196,6 +195,7 @@ def ldm_conditional_sample_one_image(
     latent_shape,
     output_size,
     noise_factor,
+    pre_images_or,
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
     modality_tensor=None,
@@ -214,11 +214,12 @@ def ldm_conditional_sample_one_image(
         noise_scheduler: The noise scheduler for the diffusion process.
         scale_factor (float): Scaling factor for the latent space.
         device (torch.device): The device to run the computation on.
-        combine_label_or (torch.Tensor): The combined label tensor.
+        combine_label_or (torch.Tensor): The combined label tensor (tumor mask).
         spacing_tensor (torch.Tensor): Tensor specifying the spacing.
         latent_shape (tuple): The shape of the latent space.
         output_size (tuple): The desired output size of the image.
         noise_factor (float): Factor to scale the initial noise.
+        pre_images_or (torch.Tensor): Pre-contrast MRI images for dual-channel ControlNet condition.
         top_region_index_tensor (torch.Tensor): Tensor specifying the top region index. Defaults to None.
         bottom_region_index_tensor (torch.Tensor): Tensor specifying the bottom region index. Defaults to None.
         modality_tensor (torch.Tensor): Int Tensor specifying the modality.
@@ -230,6 +231,25 @@ def ldm_conditional_sample_one_image(
     Returns:
         tuple: A tuple containing the synthetic image and its corresponding label.
     """
+    # CRITICAL WARNING: CFG guidance validation
+    # The model was NOT trained with mask dropout (no 10% probability of empty masks during training).
+    # Using cfg_guidance_scale > 1.0 will cause the model to extrapolate into unseen feature space,
+    # resulting in snow noise or complete collapse of generated images.
+    # RECOMMENDED VALUES: cfg_guidance_scale = 0 (disabled) or 1.0 (enabled but no amplification)
+    if cfg_guidance_scale > 1.0:
+        logging.warning("")
+        logging.warning("=" * 80)
+        logging.warning("WARNING: cfg_guidance_scale > 1.0 detected!")
+        logging.warning("The model was NOT trained with mask dropout.")
+        logging.warning("Using cfg_guidance_scale > 1.0 will likely cause:")
+        logging.warning("  - Snow noise in generated images")
+        logging.warning("  - Complete collapse of generation quality")
+        logging.warning("  - Unpredictable artifacts")
+        logging.warning("")
+        logging.warning("RECOMMENDATION: Set cfg_guidance_scale = 0 (disable) or 1.0 (safe)")
+        logging.warning("=" * 80)
+        logging.warning("")
+
     if modality_tensor<=7:
         # CT image intensity range
         a_min = -1000
@@ -265,7 +285,38 @@ def ldm_conditional_sample_one_image(
             )
             combine_label = torch.nn.functional.interpolate(combine_label, size=output_size, mode="nearest")
 
-        controlnet_cond_vis = binarize_labels(combine_label.as_tensor().long()).half()
+        # Construct dual-channel condition: [Pre-contrast MRI, Tumor Mask]
+        # combine_label: tumor mask [B, 1, H, W, D]
+        # pre_images_or: pre-contrast MRI [B, 1, H, W, D]
+        combine_label = combine_label.to(device)
+        pre_images = pre_images_or.to(device)
+
+        # Resize pre_images and combine_label to match output_size if needed
+        if (
+            output_size[0] != combine_label.shape[2]
+            or output_size[1] != combine_label.shape[3]
+            or output_size[2] != combine_label.shape[4]
+        ):
+            logging.info(
+                "output_size is not a desired value. Need to interpolate the mask to match with output_size. The result image will be very low quality."
+            )
+            combine_label = torch.nn.functional.interpolate(combine_label, size=output_size, mode="nearest")
+
+        if (
+            output_size[0] != pre_images.shape[2]
+            or output_size[1] != pre_images.shape[3]
+            or output_size[2] != pre_images.shape[4]
+        ):
+            pre_images = torch.nn.functional.interpolate(pre_images, size=output_size, mode="nearest")
+
+        # Get masks as tensor
+        if hasattr(combine_label, 'as_tensor'):
+            masks = combine_label.as_tensor().float()
+        else:
+            masks = combine_label.float()
+
+        # Construct dual-channel condition: [Pre, Mask]
+        controlnet_cond_vis = torch.cat([pre_images.half(), masks.half()], dim=1)  # [B, 2, H, W, D]
 
         # Generate random noise
         latents = initialize_noise_latents(latent_shape, device) * noise_factor
@@ -297,8 +348,23 @@ def ldm_conditional_sample_one_image(
             total=min(len(all_timesteps), len(all_next_timesteps)),
         )
         if cfg_guidance_scale > 0:
-            combine_label_no_tumor = torch.nn.functional.interpolate(remove_tumors(combine_label.squeeze(0)).unsqueeze(0).float(), size=output_size, mode="nearest").to(combine_label.dtype)
-            controlnet_cond_vis_no_tumor = binarize_labels(combine_label_no_tumor.as_tensor().long()).half()
+            # Create ROI-free condition for classifier-free guidance
+            combine_label_no_tumor = remove_tumors(combine_label.squeeze(0)).unsqueeze(0).float()
+            if (
+                output_size[0] != combine_label_no_tumor.shape[2]
+                or output_size[1] != combine_label_no_tumor.shape[3]
+                or output_size[2] != combine_label_no_tumor.shape[4]
+            ):
+                combine_label_no_tumor = torch.nn.functional.interpolate(combine_label_no_tumor, size=output_size, mode="nearest")
+
+            # Get masks as tensor
+            if hasattr(combine_label_no_tumor, 'as_tensor'):
+                masks_no_tumor = combine_label_no_tumor.as_tensor().float()
+            else:
+                masks_no_tumor = combine_label_no_tumor.float()
+
+            # Construct dual-channel condition: [Pre, Mask_no_tumor]
+            controlnet_cond_vis_no_tumor = torch.cat([pre_images.half(), masks_no_tumor.half()], dim=1)
             del combine_label_no_tumor
         for t, next_t in progress_bar:
             # get controlnet output

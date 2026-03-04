@@ -22,12 +22,19 @@ import torch.distributed as dist
 from monai.utils import RankFilter
 
 
-def setup_logging(logger_name: str = "") -> logging.Logger:
+def setup_logging(
+    logger_name: str = "",
+    log_file_path: str = None,
+    rank: int = 0
+) -> logging.Logger:
     """
-    Setup the logging configuration.
+    Setup the logging configuration with console and optional file output.
 
     Args:
         logger_name (str): logger name.
+        log_file_path (str, optional): Path to log file. If provided, logs will be written to file.
+            Only rank 0 writes to file in distributed training.
+        rank (int): Process rank. Only rank 0 writes logs to file.
 
     Returns:
         logging.Logger: Configured logger.
@@ -35,11 +42,35 @@ def setup_logging(logger_name: str = "") -> logging.Logger:
     logger = logging.getLogger(logger_name)
     if dist.is_initialized():
         logger.addFilter(RankFilter())
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s.%(msecs)03d][%(levelname)5s](%(name)s) - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+
+    # Clear existing handlers to avoid duplicates
+    logger.handlers.clear()
+
+    # Create formatter
+    formatter = logging.Formatter(
+        "[%(asctime)s.%(msecs)03d][%(levelname)5s](%(name)s) - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
+
+    # Console handler (all ranks)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler (rank 0 only, if log_file_path provided)
+    if log_file_path and rank == 0:
+        # Create log directory if it doesn't exist
+        log_dir = os.path.dirname(log_file_path)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        file_handler = logging.FileHandler(log_file_path, mode='a')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    logger.setLevel(logging.INFO)
     return logger
 
 

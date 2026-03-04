@@ -23,100 +23,78 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from monai.networks.utils import copy_model_state
 from monai.utils import RankFilter
-from monai.transforms.utils_morphological_ops import dilate
+# Removed MONAI morphology ops - using pure PyTorch implementations for stability
 from monai.networks.schedulers import RFlowScheduler
 from monai.networks.schedulers.ddpm import DDPMPredictionType
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from .utils import binarize_labels, define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
+from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
-from .augmentation import remove_tumors
+# Removed: from .augmentation import remove_tumors (no longer needed)
 
-def remove_roi(labels):
+def apply_random_morphological_perturbation(masks):
     """
-    Remove ROI voxels from a label tensor. 
-    Users need to define their own function of remove_roi.
-    Here we use scripts.augmentation.remove_tumors as default
+    Apply random morphological perturbation to tumor masks for data augmentation.
+
+    Randomly applies dilation or erosion with kernel size 1-3 voxels to simulate
+    variations in tumor segmentation boundaries.
+
+    Uses pure PyTorch implementations (F.max_pool3d) for stability and compatibility
+    with gradient computation, avoiding MONAI's native morphology ops which can cause
+    dimension/type errors in forward loops.
 
     Args:
-        labels (torch.Tensor): Segmentation tensor. Shape is
-            [B, 1, X, Y, Z]. Dtype is usually integer/long.
+        masks (torch.Tensor): Binary tumor masks. Shape [B, 1, X, Y, Z].
 
     Returns:
-        torch.Tensor: Labels with ROI content removed. Same shape and
-        device as `labels`.
+        torch.Tensor: Perturbed masks with same shape and device as input.
     """
-    labels_roi_free = []
-    for b in range(labels.shape[0]):
-        labels_roi_free_b = remove_tumors(labels[b,...])
-        labels_roi_free.append(labels_roi_free_b)
-    labels_roi_free = torch.cat(labels_roi_free,dim=0)
-    return labels_roi_free
-    
-def compute_region_contrasive_loss(
-    model_output,model_output_roi_free,model_gt,
-    roi_contrastive,roi_contrastive_bg,
-    max_region_contrasive_loss=2,
-    loss_contrastive = torch.nn.L1Loss(reduction = 'none')
-):
-    """
-    Compute region-wise contrastive losses between the model output with and
-    without ROIs, promoting differences inside ROI and similarity outside ROI.
+    masks_perturbed = []
+    for b in range(masks.shape[0]):
+        mask = masks[b:b+1]  # Keep [1, 1, X, Y, Z] shape
 
-    The loss has two parts:
-      1) `loss_region_contrasive`: encourages the model output to differ from
-         its ROI-free counterpart *inside* the ROI (foreground). Implemented as
-         a (negative) masked L1 reduced by the foreground voxel count and then
-         clipped by a ReLU window around `max_region_contrasive_loss`.
-      2) `loss_region_bg`: encourages *similarity* in the background
-         (outside ROI) between the ROI-free output and the original output,
-         implemented as masked L1 reduced by background voxel count.
+        # Randomly choose operation: 0=dilation, 1=erosion, 2=none
+        op_choice = torch.randint(0, 3, (1,)).item()
 
-    Args:
-        model_output (torch.Tensor):
-            Network output with ROI present. Shape [B, C, X, Y, Z].
-        model_output_roi_free (torch.Tensor):
-            Network output for ROI-removed labels (same shape/device).
-        roi_contrastive (torch.Tensor):
-            Foreground ROI mask (1 inside ROI, 0 outside). Can be bool or
-            integer; will be resized to `model_output.shape[2:]` using
-            nearest-neighbor and multiplied as weights.
-            Expected shape broadcastable to [B, C, X, Y, Z].
-        roi_contrastive_bg (torch.Tensor):
-            Background mask (1 outside ROI, 0 inside). Will be resized to
-            `inputs.shape[2:]` (see Notes) and repeated over channels to match
-            [B, C, X, Y, Z].
-        max_region_contrasive_loss (float, optional):
-            Upper-window parameter used to bound the foreground loss via
-            `relu(loss + max) - max`. Defaults to 2.
-        loss_contrastive (torch.nn.modules.loss._Loss, optional):
-            Elementwise regression loss with `reduction='none'` (e.g., L1).
-            Defaults to `torch.nn.L1Loss(reduction='none')`.
+        # Random kernel size between 1-3 (use odd sizes: 1, 3)
+        kernel_size = torch.randint(0, 2, (1,)).item() * 2 + 1  # 1 or 3
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - loss_region_contrasive (scalar tensor): foreground contrastive loss.
-            - loss_region_bg (scalar tensor): background similarity loss.
-    """
-    if roi_contrastive.shape[1]!=1 or roi_contrastive_bg.shape[1]!=1:
-        raise ValueError(f"Assert roi_contrastive.shape[1]==1 or roi_contrastive_bg.shape[1]==1, yet got {roi_contrastive.shape} and {roi_contrastive_bg.shape}.")
-        
-    roi_contrastive = F.interpolate(roi_contrastive, size=model_output.shape[2:], mode="nearest")  
-    roi_contrastive = roi_contrastive.repeat(1, model_output.shape[1], 1, 1, 1)    
-    loss_region_contrasive = -(loss_contrastive(model_output, model_output_roi_free)*roi_contrastive).sum()/(torch.sum(roi_contrastive>0)+1e-5)
-    loss_region_contrasive = F.relu(loss_region_contrasive+max_region_contrasive_loss)-max_region_contrasive_loss # we do not need it to be extreme           
-    
-    roi_contrastive_bg = F.interpolate(roi_contrastive_bg, size=model_output.shape[2:], mode="nearest").to(torch.long)
-    roi_contrastive_bg = roi_contrastive_bg.repeat(1, model_output.shape[1], 1, 1, 1)    
-    loss_region_bg = (loss_contrastive(model_output_roi_free, model_gt)*roi_contrastive_bg).sum()/(torch.sum(roi_contrastive_bg>0)+1e-5)
-    return loss_region_contrasive, loss_region_bg
+        if kernel_size == 1:
+            # Kernel size 1: no effect, just return original
+            mask_pert = mask
+        elif op_choice == 0:
+            # Dilation: max pooling with proper padding
+            pad_size = kernel_size // 2
+            # Use padding_mode='replicate' for better edge handling
+            mask_padded = F.pad(mask, pad=(pad_size, pad_size, pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+            mask_pert = F.max_pool3d(mask_padded, kernel_size=kernel_size, stride=1, padding=0)
+        elif op_choice == 1:
+            # Erosion: min pooling via max pool on inverted values
+            pad_size = kernel_size // 2
+            # Pad with 0s (min value for inverted mask)
+            mask_padded = F.pad(1 - mask, pad=(pad_size, pad_size, pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+            mask_pert = 1 - F.max_pool3d(mask_padded, kernel_size=kernel_size, stride=1, padding=0)
+        else:
+            # No operation
+            mask_pert = mask
+
+        # Ensure output shape matches input shape
+        if mask_pert.shape != mask.shape:
+            # Resize to match original shape
+            mask_pert = F.interpolate(mask_pert, size=mask.shape[2:], mode='nearest')
+
+        masks_perturbed.append(mask_pert)
+
+    return torch.cat(masks_perturbed, dim=0)
 
 def compute_model_output(
     images,labels,noise,timesteps,noise_scheduler,
     controlnet,unet,
     spacing_tensor,
+    pre_images=None,
+    apply_morphological_perturb=False,
     modality_tensor=None,
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
@@ -127,17 +105,18 @@ def compute_model_output(
     the ControlNet intermediate blocks) for a given noisy latent and conditions.
 
     Pipeline:
-      1) Binarize labels to build ControlNet condition.
-      2) Add noise to `images` at `timesteps` via the scheduler.
-      3) Pass noisy latent and conditions to ControlNet to get down/mid features.
-      4) Pass everything to U-Net (with spacing, optional modality & body-region
+      1) Construct dual-channel condition from pre-contrast MRI and tumor masks.
+      2) Optionally apply morphological perturbation to masks (30% probability).
+      3) Add noise to `images` at `timesteps` via the scheduler.
+      4) Pass noisy latent and conditions to ControlNet to get down/mid features.
+      5) Pass everything to U-Net (with spacing, optional modality & body-region
          tokens) to produce `model_output`.
 
     Args:
         images (torch.Tensor):
             Input latent/image tensor to be noised. Shape [B, C, X, Y, Z].
         labels (torch.Tensor or monai.data.MetaTensor):
-            Segmentation labels used to create ControlNet condition.
+            Segmentation labels (tumor masks) used to create ControlNet condition.
         noise (torch.Tensor):
             Noise tensor aligned with `images`.
         timesteps (torch.Tensor or Any):
@@ -150,6 +129,11 @@ def compute_model_output(
             Denoising network that accepts additional residuals from ControlNet.
         spacing_tensor (torch.Tensor):
             Per-sample spacing or resolution encoding; passed into U-Net.
+        pre_images (torch.Tensor, optional):
+            Pre-contrast MRI images at physical resolution [B, 1, 256, 256, 256].
+            If provided, used as first channel of dual-channel ControlNet condition.
+        apply_morphological_perturb (bool, optional):
+            Whether to apply morphological perturbation to masks. Defaults to False.
         modality_tensor (torch.Tensor, optional):
             Class labels or modality codes for conditional generation (e.g., MRI/CT).
         top_region_index_tensor (torch.Tensor, optional):
@@ -170,8 +154,26 @@ def compute_model_output(
     include_modality = ( modality_tensor is not None )
     include_body_region = ( top_region_index_tensor is not None) and (bottom_region_index_tensor is not None)
 
-    # use binary encoding to encode segmentation mask
-    controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+    # Construct dual-channel condition: [Pre-contrast MRI, Tumor Mask]
+    # labels can be either a MetaTensor or torch.Tensor
+    if hasattr(labels, 'as_tensor'):
+        masks = labels.as_tensor().to(torch.long)
+    else:
+        masks = labels.to(torch.long)
+
+    masks = masks.float()
+
+    # Apply morphological perturbation with 30% probability
+    if apply_morphological_perturb and torch.rand(1).item() < 0.3:
+        masks = apply_random_morphological_perturbation(masks)
+
+    # If pre_images provided, use dual-channel [Pre, Mask]
+    # Otherwise duplicate mask to 2 channels for compatibility (inference-only paths)
+    if pre_images is not None:
+        controlnet_cond = torch.cat([pre_images.float(), masks], dim=1)  # [B, 2, H, W, D]
+    else:
+        # Fallback: duplicate mask to 2 channels for backward compatibility
+        controlnet_cond = torch.cat([masks, masks], dim=1)  # [B, 2, H, W, D]
 
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
@@ -224,42 +226,32 @@ def train_controlnet(
     env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int
 ) -> None:
     # Step 0: configuration
-    logger = logging.getLogger("maisi.controlnet.training")
     # whether to use distributed data parallel
     use_ddp = num_gpus > 1
     if use_ddp:
         rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         device = setup_ddp(rank, world_size)
-        logger.addFilter(RankFilter())
     else:
         rank = 0
         world_size = 1
         device = torch.device(f"cuda:{rank}")
 
     torch.cuda.set_device(device)
-    logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
-    logger.info(f"World_size: {world_size}")
 
     args = load_config(env_config_path, model_config_path, model_def_path)
-    if "use_region_contrasive_loss" not in args.controlnet_train.keys():
-        args.use_region_contrasive_loss = False
-    else:
-        args.use_region_contrasive_loss = args.controlnet_train["use_region_contrasive_loss"]
-        for k in ["region_contrasive_loss_delta", "region_contrasive_loss_weight"]:
-            if k not in args.controlnet_train.keys():
-                raise ValueError(f"Since 'use_region_contrasive_loss' is in 'controlnet_train' of {model_config_path}, we need 'region_contrasive_loss_delta' and 'region_contrasive_loss_weight' also be in it.")
-    
-    logger.info(f"use_region_contrasive_loss: {args.use_region_contrasive_loss}")
-    if args.use_region_contrasive_loss:
-        logger.warning(f"User sets 'use_region_contrasive_loss' as true in {model_config_path}.")
-        logger.warning("********************")
-        logger.warning(
-            "Please check remove_roi() in train_controlnet.py to ensure ROI is removed as intended; "
-            "default logic will not match your requirement."
-        )
-        logger.warning("********************")
 
+    # Setup logging with file output
+    log_file_path = os.path.join(args.output_dir, "logs", args.exp_name, "train.log")
+    logger = setup_logging(
+        logger_name="maisi.controlnet.training",
+        log_file_path=log_file_path,
+        rank=rank
+    )
+
+    logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
+    logger.info(f"World_size: {world_size}")
+    logger.info(f"Log file: {log_file_path}")
 
     # initialize tensorboard writer
     if rank == 0:
@@ -334,8 +326,6 @@ def train_controlnet(
     )
 
     # Step 3: training config
-    weighted_loss = args.controlnet_train["weighted_loss"]
-    weighted_loss_label = args.controlnet_train["weighted_loss_label"]
     optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
@@ -348,14 +338,12 @@ def train_controlnet(
     total_step = 0
     best_loss = 1e4
 
-    if weighted_loss > 1.0:
-        logger.info(f"apply weighted loss = {weighted_loss} on labels: {weighted_loss_label}")
-
     controlnet.train()
     unet.eval()
     prev_time = time.time()
     for epoch in range(n_epochs):
         epoch_loss_ = 0
+        valid_batches = 0  # Track number of valid (non-NaN) batches
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
             images = batch["image"].to(device) * scale_factor
@@ -376,9 +364,6 @@ def train_controlnet(
 
             optimizer.zero_grad(set_to_none=True)
 
-            if args.use_region_contrasive_loss:
-                labels_roi_free = remove_roi(labels)
-
             with autocast("cuda", enabled=True):
                 # randomly sample noise
                 noise_shape = list(images.shape)
@@ -390,34 +375,25 @@ def train_controlnet(
                     timesteps = torch.randint(
                         0, noise_scheduler.num_train_timesteps, (images.shape[0],), device=images.device
                     ).long()
+
+                # Get pre-contrast images from batch for dual-channel ControlNet condition
+                pre_images = batch["pre"].to(device)  # [B, 1, 256, 256, 256]
+
                 (
-                    model_output, 
-                    model_block1_output, 
+                    model_output,
+                    model_block1_output,
                     model_block2_output
                 ) = compute_model_output(
                     images,labels,noise,timesteps,noise_scheduler,
                     controlnet,unet,
                     spacing_tensor,
-                    modality_tensor,
-                    top_region_index_tensor,
-                    bottom_region_index_tensor,
+                    pre_images=pre_images,
+                    apply_morphological_perturb=True,
+                    modality_tensor=modality_tensor,
+                    top_region_index_tensor=top_region_index_tensor,
+                    bottom_region_index_tensor=bottom_region_index_tensor,
                     return_controlnet_blocks=False
                 )
-                if args.use_region_contrasive_loss:
-                    (
-                        model_output_roi_free,
-                        model_block1_output_roi_free,
-                        model_block2_output_roi_free,
-                    ) = compute_model_output(
-                        images,labels_roi_free,noise,timesteps,noise_scheduler,
-                        controlnet,unet,
-                        spacing_tensor,
-                        modality_tensor,
-                        top_region_index_tensor,
-                        bottom_region_index_tensor,
-                        return_controlnet_blocks=False
-                    )
-                
 
                 if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
                     # predict noise
@@ -434,49 +410,70 @@ def train_controlnet(
                         f"[{DDPMPredictionType.EPSILON},{DDPMPredictionType.SAMPLE},{DDPMPredictionType.V_PREDICTION}]",
                     )
     
-                if weighted_loss > 1.0:
-                    weights = torch.ones_like(images).to(images.device)
-                    roi = torch.zeros([noise_shape[0]] + [1] + noise_shape[2:]).to(images.device)
-                    interpolate_label = F.interpolate(labels, size=images.shape[2:], mode="nearest")
-                    # assign larger weights for ROI (tumor)
-                    for label in weighted_loss_label:
-                        roi[interpolate_label == label] = 1
-                    weights[roi.repeat(1, images.shape[1], 1, 1, 1) == 1] = weighted_loss
-                    loss = (F.l1_loss(model_output.float(), model_gt.float(), reduction="none") * weights).mean()
+                # ========== The Great Cleanup: Pure Loss Implementation ==========
+                # 1. Precise dimension reduction using Max Pooling (preserves ANY tiny lesion!)
+                # labels: [B, 1, 256, 256, 256] -> roi_mask_latent: [B, 1, 64, 64, 64]
+                roi_mask_latent = F.max_pool3d(labels.float(), kernel_size=4, stride=4) > 0.0
+
+                # 2. Base Global L1 with moderate ROI weighting
+                weights = torch.ones_like(model_output)
+                weights[roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)] = 3.0
+                l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
+                loss = (l1_loss_raw * weights).mean()
+
+                # 3. Absolute Background Penalty (严查假阳性糊团)
+                # Penalize false positives in background regions to suppress snow noise
+                if roi_mask_latent.sum() > 0:
+                    # Has tumor: background = ~roi
+                    bg_mask_expanded = (~roi_mask_latent).repeat(1, model_output.shape[1], 1, 1, 1)
                 else:
-                    loss = F.l1_loss(model_output.float(), model_gt.float())
-    
-    
-                if args.use_region_contrasive_loss:
-                    roi_contrastive = (labels_roi_free != labels).to(torch.uint8)  # 0/1 mask
-                    roi_contrastive_bg = 1 - dilate(roi_contrastive, filter_size=3).to(torch.uint8)
-                    loss_region_contrasive, loss_region_bg = compute_region_contrasive_loss(
-                        model_output,model_output_roi_free,model_gt,
-                        roi_contrastive,roi_contrastive_bg,
-                        max_region_contrasive_loss=args.controlnet_train["region_contrasive_loss_delta"],
-                        loss_contrastive = torch.nn.L1Loss(reduction = 'none')
-                    )
-                    final_loss_region_contrasive = loss_region_contrasive + loss_region_bg
-                    logger.info(f"loss_region_contrasive: {loss_region_contrasive}")
-                    logger.info(f"loss_region_bg: {loss_region_bg}")
-                    loss += args.controlnet_train["region_contrasive_loss_weight"]*final_loss_region_contrasive
+                    # No tumor: entire image is background
+                    bg_mask_expanded = torch.ones_like(model_output, dtype=torch.bool)
+
+                pred_bg = model_output.float()[bg_mask_expanded]
+                gt_bg = model_gt.float()[bg_mask_expanded]
+
+                # Only penalize false positives (white spots that shouldn't be there)
+                # F.relu(pred - gt) = max(0, pred - gt): only positive when pred > gt
+                false_positive_bg = F.relu(pred_bg - gt_bg)
+                loss = loss + 5.0 * (false_positive_bg ** 2).mean()
+
+            # Check for NaN loss before backward pass
+            loss_value = loss.detach().cpu().item()
+            if not torch.isfinite(loss):
+                # Log warning and skip this batch
+                logger.warning(
+                    f"NaN or Inf loss detected at [Epoch {epoch + 1}/{n_epochs}] [Batch {step + 1}/{len(train_loader)}]. "
+                    f"Skipping this batch."
+                )
+                # Check if inputs have NaN
+                if torch.isnan(images).any():
+                    logger.warning(f"  -> images contains NaN!")
+                if torch.isnan(labels).any():
+                    logger.warning(f"  -> labels contains NaN!")
+                if torch.isnan(pre_images).any():
+                    logger.warning(f"  -> pre_images contains NaN!")
+                continue  # Skip this batch
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step()
             total_step += 1
+            valid_batches += 1  # Increment valid batch counter
 
             if rank == 0:
                 # write train loss for each batch into tensorboard
                 tensorboard_writer.add_scalar(
-                    "train/train_controlnet_loss_iter", loss.detach().cpu().item(), total_step
+                    "train/train_controlnet_loss_iter", loss_value, total_step
                 )
                 batches_done = step + 1
                 batches_left = len(train_loader) - batches_done
                 time_left = timedelta(seconds=batches_left * (time.time() - prev_time))
                 prev_time = time.time()
-                logger.info(
+
+                # Console output: every batch (for real-time monitoring)
+                print(
                     "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
                     % (
                         epoch + 1,
@@ -484,13 +481,43 @@ def train_controlnet(
                         step + 1,
                         len(train_loader),
                         lr_scheduler.get_last_lr()[0],
-                        loss.detach().cpu().item(),
+                        loss_value,
                         time_left,
-                    )
+                    ),
+                    end="", flush=True
                 )
+
+                # File output: every 100 batches (to keep log file manageable)
+                if (step + 1) % 100 == 0 or (step + 1) == len(train_loader):
+                    logger.info(
+                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s"
+                        % (
+                            epoch + 1,
+                            n_epochs,
+                            step + 1,
+                            len(train_loader),
+                            lr_scheduler.get_last_lr()[0],
+                            loss_value,
+                            time_left,
+                        )
+                    )
             epoch_loss_ += loss.detach()
 
-        epoch_loss = epoch_loss_ / (step + 1)
+        # Calculate epoch average, accounting for skipped batches
+        if valid_batches > 0:
+            epoch_loss = epoch_loss_ / valid_batches
+        else:
+            # All batches were skipped (NaN), use previous loss or skip this epoch
+            logger.warning(f"[Epoch {epoch + 1}/{n_epochs}] All batches skipped due to NaN loss!")
+            epoch_loss = torch.tensor(0.0)  # Placeholder
+
+        # Print newline and summary after epoch
+        if rank == 0:
+            print()  # newline after progress bar
+            if valid_batches < len(train_loader):
+                logger.info(
+                    f"[Epoch {epoch + 1}/{n_epochs}] Skipped {len(train_loader) - valid_batches}/{len(train_loader)} batches due to NaN loss"
+                )
 
         if use_ddp:
             dist.barrier()

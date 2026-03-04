@@ -26,7 +26,15 @@ import monai
 from monai.bundle import ConfigParser
 from monai.config import DtypeLike, NdarrayOrTensor
 from monai.data import CacheDataset, DataLoader, partition_dataset
-from monai.transforms import Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd
+from monai.transforms import (
+    Compose,
+    EnsureTyped,
+    Lambdad,
+    LoadImaged,
+    Orientationd,
+    RandAdjustContrastd,
+    RandGaussianNoised,
+)
 from monai.transforms.utils_morphological_ops import dilate, erode
 from monai.utils import TransformBackends, convert_data_type, convert_to_dst_type, get_equivalent_dtype
 from scipy import stats
@@ -251,10 +259,18 @@ def add_data_dir2path(list_files: list, data_dir: str, fold: int = None) -> tupl
         if "label" in d:
             d["label"] = os.path.join(data_dir, d["label"])
 
+        if "pre" in d:
+            d["pre"] = os.path.join(data_dir, d["pre"])
+
         if fold is not None:
-            if d["fold"] == fold:
-                new_list_files_val.append(copy.deepcopy(d))
+            # Handle datasets with and without fold field
+            if "fold" in d:
+                if d["fold"] == fold:
+                    new_list_files_val.append(copy.deepcopy(d))
+                else:
+                    new_list_files_train.append(copy.deepcopy(d))
             else:
+                # No fold information, use all data for training
                 new_list_files_train.append(copy.deepcopy(d))
 
     if fold is not None:
@@ -304,10 +320,14 @@ def prepare_maisi_controlnet_json_dataloader(
             json_data = json.load(f)["training"]
         list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
 
+    # Common transforms applied to both train and val
+    # NO spatial augmentation (no crop, flip, rotate, zoom, etc.) to maintain alignment
+    # Data already preprocessed to RAS orientation
     common_transform = [
-        LoadImaged(keys=["image", "label"], image_only=True, ensure_channel_first=True),
+        LoadImaged(keys=["image", "pre", "label"], image_only=True, ensure_channel_first=True),
         Orientationd(keys=["label"], axcodes="RAS"),
         EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
+        EnsureTyped(keys=["pre"], dtype=torch.float32, track_meta=False),
         Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
         Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
         Lambdad(keys="spacing", func=lambda x: torch.FloatTensor(x)),
@@ -319,7 +339,16 @@ def prepare_maisi_controlnet_json_dataloader(
         ),
         EnsureTyped(keys=['modality'], dtype=torch.long, allow_missing_keys=True),
     ]
-    train_transforms, val_transforms = Compose(common_transform), Compose(common_transform)
+
+    # Intensity augmentation for pre-contrast images ONLY (applied to train set only)
+    # NO spatial augmentation to preserve pre-mask-subtraction alignment
+    train_intensity_augment = [
+        RandGaussianNoised(keys=["pre"], prob=0.15, mean=0.0, std=0.05),
+        RandAdjustContrastd(keys=["pre"], prob=0.20, gamma=(0.8, 1.2)),
+    ]
+
+    train_transforms = Compose(common_transform + train_intensity_augment)
+    val_transforms = Compose(common_transform)
 
     train_loader = None
 
