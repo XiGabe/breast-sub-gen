@@ -114,7 +114,7 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 - [x] 目标：U-Net 全冻结。ControlNet 专心学双通道映射。
 - [x] 配置：`configs/config_maisi_controlnet_train_stage1.json`
 - [x] 脚本：`scripts/submit_stage1.sh`
-- [x] 超参：ControlNet LR `1e-4`, U-Net 全冻结
+- [x] 超参：ControlNet LR `1e-4`, U-Net 全冻结, 每 2 epoch 验证
 
 #### Stage 3.2: 深层语义放行期 (50 epochs)
 - [x] 目标：解决亮度不足。解冻深层特征路由，释放高光异常值。
@@ -127,6 +127,10 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 - [x] 配置：`configs/config_maisi_controlnet_train_stage3.json`
 - [x] 脚本：`scripts/submit_stage3.sh`
 - [x] 超参：U-Net LR `1e-5`, 全部 U-Net 块解冻
+
+**Checkpoint 策略**:
+- 每个 epoch 保存独立文件: `{exp_name}_epoch_{N}.pt`
+- `best.pt` 跟踪最佳 validation loss (无验证时用 training loss)
 
 **使用方式**:
 ```bash
@@ -274,6 +278,19 @@ tensorboard --logdir outputs/tfevent
 
 ## 修改日志 (Modification Log)
 
+### 2026-03-04 - Checkpoint 策略与 Validation 支持
+
+**Completed Tasks**:
+- ✅ 每个 epoch 保存独立 checkpoint (`_epoch_{N}.pt`)
+- ✅ 移除 `_current.pt`（不再覆盖式保存）
+- ✅ 添加 validation loop（每 N epoch）
+- ✅ `best.pt` 基于 validation loss（无验证时 fallback 到 training loss）
+- ✅ 配置参数：`validation_frequency` (默认: 2)
+
+**Files Modified**:
+- `scripts/train_controlnet.py`: Checkpoint 保存逻辑, validation loop
+- `configs/config_maisi_controlnet_train_stage{1,2,3}.json`: 添加 `validation_frequency: 2`
+
 ### 2026-03-04 - Stage 3 渐进式微调实现 (Shell Script 分阶段方案)
 
 **Completed Tasks**:
@@ -388,14 +405,29 @@ tensorboard --logdir outputs/tfevent
 
 ### Saved Files
 
-- `models/{exp_name}_current.pt`: Latest checkpoint (each epoch)
-- `models/{exp_name}_best.pt`: Best checkpoint (lowest val loss)
+- `models/{exp_name}_epoch_{N}.pt`: Per-epoch checkpoint (independent, not overwritten)
+- `models/{exp_name}_best.pt`: Best checkpoint (lowest val loss, or train loss if no val)
+
+### Example (Stage 1, 50 epochs)
+
+```
+models/
+├── breast_controlnet_stage1_epoch_1.pt
+├── breast_controlnet_stage1_epoch_2.pt
+├── ...
+├── breast_controlnet_stage1_epoch_50.pt
+└── breast_controlnet_stage1_best.pt
+```
 
 ### Loading Checkpoints
 
 ```python
-checkpoint = torch.load("models/controlnet_breast_dual_channel_test_best.pt")
+checkpoint = torch.load("models/breast_controlnet_stage1_best.pt")
 controlnet.load_state_dict(checkpoint["controlnet_state_dict"])
+
+# Load fine-tuned U-Net if available (Stage 2+)
+if checkpoint["unet_state_dict"] is not None:
+    unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
 ```
 
 ---

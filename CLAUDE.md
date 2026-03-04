@@ -229,19 +229,28 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 Uses **shell script stages** to avoid optimizer momentum loss. Each stage creates a fresh optimizer.
 
 ### Stage 3.1: ControlNet Alignment
-- U-Net: Frozen | LR: 1e-4 | Epochs: 50
+- U-Net: Frozen | LR: 1e-4 | Epochs: 50 | Val every: 2
 - Config: `config_maisi_controlnet_train_stage1.json`
-- Output: `models/breast_controlnet_stage1_best.pt`
+- Output: `models/breast_controlnet_stage1_epoch_{N}.pt`, `*_best.pt`
 
 ### Stage 3.2: Deep Semantic Release
 - Unfreeze: Deep blocks (`down_blocks.2`, `down_blocks.3`, `middle_block`, `up_blocks`)
 - U-Net LR: 5e-5 | Epochs: 50 | Inplace disabled
-- Output: `models/breast_controlnet_stage2_best.pt`
+- Output: `models/breast_controlnet_stage2_epoch_{N}.pt`, `*_best.pt`
 
 ### Stage 3.3: Shallow Edge Refinement
 - Unfreeze: All blocks
 - U-Net LR: 1e-5 | Epochs: 50
-- Output: `models/breast_controlnet_stage3_best.pt`
+- Output: `models/breast_controlnet_stage3_epoch_{N}.pt`, `*_best.pt`
+
+---
+
+## Checkpoint Strategy
+
+| File | Description |
+|------|-------------|
+| `{exp_name}_epoch_{N}.pt` | Saved every epoch (independent) |
+| `{exp_name}_best.pt` | Best validation loss (or training loss if no val) |
 
 ---
 
