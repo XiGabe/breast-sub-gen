@@ -537,7 +537,7 @@ def train_controlnet(
                 weights = torch.ones_like(model_output)
                 weights[roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)] = 3.0
                 l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
-                loss = (l1_loss_raw * weights).mean()
+                l1_loss = (l1_loss_raw * weights).mean()
 
                 # 3. Absolute Background Penalty (严查假阳性糊团)
                 # Penalize false positives in background regions to suppress snow noise
@@ -554,10 +554,16 @@ def train_controlnet(
                 # Only penalize false positives (white spots that shouldn't be there)
                 # F.relu(pred - gt) = max(0, pred - gt): only positive when pred > gt
                 false_positive_bg = F.relu(pred_bg - gt_bg)
-                loss = loss + 5.0 * (false_positive_bg ** 2).mean()
+                bg_penalty_loss = 5.0 * (false_positive_bg ** 2).mean()
+
+                # Total loss
+                loss = l1_loss + bg_penalty_loss
 
             # Check for NaN loss before backward pass
             loss_value = loss.detach().cpu().item()
+            l1_loss_value = l1_loss.detach().cpu().item()
+            bg_penalty_value = bg_penalty_loss.detach().cpu().item()
+
             if not torch.isfinite(loss):
                 # Log warning and skip this batch
                 logger.warning(
@@ -585,6 +591,12 @@ def train_controlnet(
                 tensorboard_writer.add_scalar(
                     "train/train_controlnet_loss_iter", loss_value, total_step
                 )
+                tensorboard_writer.add_scalar(
+                    "train/l1_loss_iter", l1_loss_value, total_step
+                )
+                tensorboard_writer.add_scalar(
+                    "train/bg_penalty_loss_iter", bg_penalty_value, total_step
+                )
                 batches_done = step + 1
                 batches_left = len(train_loader) - batches_done
                 time_left = timedelta(seconds=batches_left * (time.time() - prev_time))
@@ -592,7 +604,7 @@ def train_controlnet(
 
                 # Console output: every batch (for real-time monitoring)
                 print(
-                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
+                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s "
                     % (
                         epoch + 1,
                         n_epochs,
@@ -600,6 +612,8 @@ def train_controlnet(
                         len(train_loader),
                         lr_scheduler.get_last_lr()[0],
                         loss_value,
+                        l1_loss_value,
+                        bg_penalty_value,
                         time_left,
                     ),
                     end="", flush=True
@@ -608,7 +622,7 @@ def train_controlnet(
                 # File output: every 100 batches (to keep log file manageable)
                 if (step + 1) % 100 == 0 or (step + 1) == len(train_loader):
                     logger.info(
-                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s"
+                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Total: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s"
                         % (
                             epoch + 1,
                             n_epochs,
@@ -616,6 +630,8 @@ def train_controlnet(
                             len(train_loader),
                             lr_scheduler.get_last_lr()[0],
                             loss_value,
+                            l1_loss_value,
+                            bg_penalty_value,
                             time_left,
                         )
                     )
@@ -654,11 +670,33 @@ def train_controlnet(
 
                 with torch.no_grad():
                     for val_step, val_batch in enumerate(val_loader):
+                        # Check if all required keys exist
+                        if "image" not in val_batch:
+                            logger.warning(f"[Validation Batch {val_step}] Missing 'image' key in val_batch. Keys: {list(val_batch.keys())}")
+                            continue
+                        if "label" not in val_batch:
+                            logger.warning(f"[Validation Batch {val_step}] Missing 'label' key in val_batch. Keys: {list(val_batch.keys())}")
+                            continue
+                        if "pre" not in val_batch:
+                            logger.warning(f"[Validation Batch {val_step}] Missing 'pre' key in val_batch. Keys: {list(val_batch.keys())}")
+                            continue
+
                         val_images = val_batch["image"].to(device) * scale_factor
                         val_labels = val_batch["label"].to(device)
                         val_spacing_tensor = val_batch["spacing"].to(device)
                         val_pre_images = val_batch["pre"].to(device)
                         val_modality_tensor = val_batch["modality"].to(device) if include_modality else None
+
+                        # Check for NaN in inputs
+                        if torch.isnan(val_images).any():
+                            logger.warning(f"[Validation Batch {val_step}] val_images contains NaN!")
+                            continue
+                        if torch.isnan(val_labels).any():
+                            logger.warning(f"[Validation Batch {val_step}] val_labels contains NaN!")
+                            continue
+                        if torch.isnan(val_pre_images).any():
+                            logger.warning(f"[Validation Batch {val_step}] val_pre_images contains NaN!")
+                            continue
 
                         val_noise = torch.randn_like(val_images)
                         if isinstance(noise_scheduler, RFlowScheduler):
@@ -684,12 +722,12 @@ def train_controlnet(
                             else:
                                 raise ValueError(f"Unknown prediction type: {noise_scheduler.prediction_type}")
 
-                            # Same loss computation as training
+                            # Same loss computation as training, but separate components
                             val_roi_mask_latent = F.max_pool3d(val_labels.float(), kernel_size=4, stride=4) > 0.0
                             val_weights = torch.ones_like(val_model_output)
                             val_weights[val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)] = 3.0
                             val_l1_loss_raw = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
-                            val_loss = (val_l1_loss_raw * val_weights).mean()
+                            val_l1_loss = (val_l1_loss_raw * val_weights).mean()
 
                             if val_roi_mask_latent.sum() > 0:
                                 val_bg_mask_expanded = (~val_roi_mask_latent).repeat(1, val_model_output.shape[1], 1, 1, 1)
@@ -699,11 +737,25 @@ def train_controlnet(
                             val_pred_bg = val_model_output.float()[val_bg_mask_expanded]
                             val_gt_bg = val_model_gt.float()[val_bg_mask_expanded]
                             val_false_positive_bg = F.relu(val_pred_bg - val_gt_bg)
-                            val_loss = val_loss + 5.0 * (val_false_positive_bg ** 2).mean()
+                            val_bg_penalty_loss = 5.0 * (val_false_positive_bg ** 2).mean()
 
-                        if not torch.isnan(val_loss):
-                            val_loss_ += val_loss.detach()
-                            val_valid_batches += 1
+                            # Total validation loss
+                            val_loss = val_l1_loss + val_bg_penalty_loss
+
+                        # Check for NaN or Inf loss
+                        if not torch.isfinite(val_loss):
+                            logger.warning(
+                                f"[Validation Batch {val_step}] NaN or Inf loss detected! "
+                                f"loss={val_loss}. Skipping this batch."
+                            )
+                            if torch.isnan(val_model_output).any():
+                                logger.warning(f"  -> val_model_output contains NaN!")
+                            if torch.isnan(val_model_gt).any():
+                                logger.warning(f"  -> val_model_gt contains NaN!")
+                            continue
+
+                        val_loss_ += val_loss.detach()
+                        val_valid_batches += 1
 
                 if val_valid_batches > 0:
                     val_loss = val_loss_ / val_valid_batches

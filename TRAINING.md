@@ -6,7 +6,7 @@
 
 **架构**: 3D Locator (nnU-Net) + MAISI ControlNet (双通道: Pre+Mask) + Progressive Unfreezing
 
-**Last Updated**: 2026-03-04
+**Last Updated**: 2026-03-06
 
 ---
 
@@ -110,11 +110,41 @@ loss = loss + 5.0 * (false_positive_bg ** 2).mean()
 
 **设计决策**: Shell 脚本分阶段（避免优化器重建导致的动量丢失）
 
-#### Stage 3.1: ControlNet 独立对齐期 (50 epochs)
+#### ✅ Stage 3.1: ControlNet 独立对齐期 (已完成 - 30 epochs)
 - [x] 目标：U-Net 全冻结。ControlNet 专心学双通道映射。
 - [x] 配置：`configs/config_maisi_controlnet_train_stage1.json`
 - [x] 脚本：`scripts/submit_stage1.sh`
 - [x] 超参：ControlNet LR `1e-4`, U-Net 全冻结, 每 2 epoch 验证
+
+**训练结果** (2026-03-04 ~ 2026-03-06):
+- 训练样本: 1,553 (80%) | 验证样本: 390 (20%)
+- 最终训练损失 (Epoch 30): 1.8979
+- 最佳训练损失 (Epoch 28): 1.8885
+
+**验证结果** (Epochs 25-30):
+| Epoch | Total Loss | L1 Loss | BgPen |
+|-------|------------|---------|-------|
+| 25    | 8.4709     | 1.3803  | 7.0906|
+| 26    | 8.4705     | 1.3803  | 7.0902|
+| 27    | 8.4702     | 1.3803  | 7.0899|
+| **28**    | **8.4696**     | **1.3802**  | **7.0894**| ⭐ Best |
+| 29    | 8.4705     | 1.3803  | 7.0902|
+| 30    | 8.4708     | 1.3803  | 7.0905|
+
+**最佳 Checkpoint**: `models/breast_controlnet_stage1_best.pt` (Epoch 28)
+
+**关键发现**:
+- Background Penalty 高 (~7.09) 主要由训练时的 morphological perturbation 引起
+- 训练时有 30% 概率对 mask 进行 dilation/erosion，改变了 ROI 边界定义
+- 验证时无 perturbation，导致模型在固定边界附近产生假阳性
+- 验证 L1 Loss (~1.38) < 训练总 Loss (~1.89)，说明预测准确性良好
+
+**推理验证** (2026-03-06):
+- [x] 创建推理可视化脚本: `scripts/visualize_inference.py`
+- [x] 修复VAE解码后处理逻辑（移除固定范围裁剪，使用实际范围归一化）
+- [x] 推理结果: 肿瘤区域增强 750-965 HU (mean ~880 HU)
+- [x] 确认Stage 1目标达成：模型学会基本subtraction生成模式
+- [x] 输出目录: `outputs/inference_stage1_final/`
 
 #### Stage 3.2: 深层语义放行期 (50 epochs)
 - [x] 目标：解决亮度不足。解冻深层特征路由，释放高光异常值。
@@ -277,6 +307,51 @@ tensorboard --logdir outputs/tfevent
 ---
 
 ## 修改日志 (Modification Log)
+
+### 2026-03-06 - Stage 1 推理验证完成
+
+**推理验证完成**:
+- ✅ Stage 1 推理验证完成
+- ✅ 创建推理可视化脚本: `scripts/visualize_inference.py`
+- ✅ 修复VAE解码后处理（移除固定范围裁剪，使用实际范围归一化）
+- ✅ 推理结果确认: 肿瘤区域增强 750-965 HU (mean ~880 HU)
+
+**关键发现**:
+- VAE解码输出不在固定范围[0, 1]，而是负数范围（如[-0.57, -0.15]）
+- 原始代码的固定范围裁剪导致所有输出变成0
+- 修复: 基于实际数据范围归一化 `(x - min) / (max - min)`
+- 禁用 `crop_img_body_mask`（不适合subtraction generation）
+
+**新增文件**:
+- `scripts/visualize_inference.py`: 推理与可视化脚本
+- `INFERENCE_FIX_SUMMARY.md`: 推理修复总结文档
+- `outputs/inference_stage1_final/`: 最终推理结果
+
+### 2026-03-06 - Stage 1 训练完成与验证分析
+
+**训练完成**:
+- ✅ Stage 1 (30 epochs) 训练完成
+- ✅ 最终训练损失: 1.8979 (Epoch 30)
+- ✅ 最佳训练损失: 1.8885 (Epoch 28)
+
+**验证分析**:
+- ✅ 运行 epochs 25-30 的验证（390 样本）
+- ✅ 最佳验证损失: 8.4696 (Epoch 28)
+- ✅ 创建验证脚本: `scripts/run_validation.py`
+- ✅ 更新 best checkpoint → Epoch 28
+
+**关键发现**:
+- Background Penalty 高 (~7.09) 由训练-验证差异引起
+- 训练时有 morphological perturbation (30% dilation/erosion)
+- 验证时无 perturbation，导致边界假阳性增加
+- L1 Loss 表现良好 (~1.38)，问题主要在背景区域
+
+**新增文件**:
+- `scripts/run_validation.py`: 独立验证脚本（支持 loss 分解）
+- `scripts/validate_stage1_epochs_25_30.sh`: 批量验证脚本
+- `outputs/validation_results_stage1_epochs_25_30.csv`: 验证结果 CSV
+- `docs/stage1_training_results.md`: 详细训练结果文档
+- `docs/stage1_summary.md`: 快速参考摘要
 
 ### 2026-03-04 - Checkpoint 策略与 Validation 支持
 

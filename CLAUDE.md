@@ -62,10 +62,14 @@ breast-sub-gen/
 │   ├── dataset_breast.json     # Original dataset JSON
 │   └── dataset_breast_cached.json  # Cached dataset with patient splits
 ├── models/                     # Model checkpoints (created during training)
-│   └── *_best.pt, *_current.pt
-└── weights/
-    ├── autoencoder_v2.pt       # Pre-trained VAE (encoder+decoder)
-    └── diff_unet_3d_rflow-mr.pt # Pre-trained diffusion U-Net
+│   └── *_best.pt, *_epoch_*.pt
+├── weights/
+│   ├── autoencoder_v2.pt       # Pre-trained VAE (encoder+decoder)
+│   └── diff_unet_3d_rflow-mr.pt # Pre-trained diffusion U-Net
+└── outputs/
+    ├── logs/                   # Training logs
+    ├── inference_*/            # Inference visualization outputs
+    └── tfevent/                # TensorBoard event files
 ```
 
 ---
@@ -156,7 +160,27 @@ Inference script for generating subtraction images. Uses dual-channel input.
 
 ### `scripts/sample.py`
 Diffusion sampling/inference with CFG guidance validation.
+**VAE后处理关键**: VAE解码输出不在[0, 1]范围，使用实际范围归一化
 **WARNING**: `cfg_guidance_scale` should be 0 or 1.0 (model not trained with mask dropout).
+
+### `scripts/visualize_inference.py`
+Inference visualization script for model validation:
+- Multi-view visualization (axial, sagittal, coronal)
+- Statistics output (tumor enhancement intensity)
+- Supports all stage checkpoints (1/2/3)
+Diffusion sampling/inference with CFG guidance validation.
+**WARNING**: `cfg_guidance_scale` should be 0 or 1.0 (model not trained with mask dropout).
+
+**VAE解码后处理** (scripts/sample.py:460-520):
+- VAE解码输出不在固定范围[0, 1]，需要基于实际范围归一化
+- 使用 `use_crop_body_mask=False` (subtraction generation不应裁剪)
+- 归一化: `(synthetic_images - actual_min) / (actual_max - actual_min)`
+
+### `scripts/visualize_inference.py`
+推理与可视化脚本，用于验证模型性能：
+- 加载Stage 1/2/3 checkpoint
+- 生成subtraction图像并创建多视角可视化
+- 输出统计信息（肿瘤区域增强强度）
 
 ### `scripts/utils.py`
 - `prepare_maisi_controlnet_json_dataloader()`: Creates train/val dataloaders from JSON
@@ -261,6 +285,7 @@ Uses **shell script stages** to avoid optimizer momentum loss. Each stage create
 3. **Patient-level splits** are critical - no data leakage between train/val (already handled in dataset JSON)
 4. **VAE scale factor** from pretrained checkpoint must be used to scale latents before model input (no additional [-1, 1] normalization needed)
 5. **CFG Guidance**: Use `cfg_guidance_scale = 0` or `1.0` only - model was NOT trained with mask dropout, so values > 1.0 will cause artifacts
+6. **VAE解码后处理**: 不要使用固定范围裁剪，VAE输出可能在负数范围，需要基于实际范围归一化
 
 ---
 
@@ -276,3 +301,8 @@ Uses **shell script stages** to avoid optimizer momentum loss. Each stage create
 **Key insight**: ~22% of samples have no tumor (mask all zeros). This ensures the model learns to handle:
 - `[pre_with_tumor, tumor_mask]` → subtraction with tumor enhancement
 - `[pre_healthy, all_zeros_mask]` → near-black subtraction (no enhancement)
+
+**Stage 1 Inference Results** (Epoch 28 best checkpoint):
+- 肿瘤区域增强: 750-965 HU (mean ~880 HU)
+- 整体平均值: ~450 HU
+- 确认模型学会基本subtraction生成模式

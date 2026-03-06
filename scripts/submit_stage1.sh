@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=sablab-gpu
 #SBATCH --gres=gpu:a40:1
-#SBATCH --mem=20G
+#SBATCH --mem=60G
 #SBATCH --cpus-per-task=4
 #SBATCH --job-name=breast_stage1
 #SBATCH --output=slurm_stage1_%j.out
@@ -14,11 +14,15 @@
 
 set -e  # Exit on error
 
+# Change to project directory
+cd /midtier/sablab/scratch/hoc4008/breast-sub-gen
+
 echo "=========================================="
 echo "Stage 3.1: ControlNet Alignment"
 echo "=========================================="
 echo "Starting time: $(date)"
 
+eval "$(conda shell.bash hook)"
 conda activate breast_gen
 
 python -m scripts.train_controlnet \

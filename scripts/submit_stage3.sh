@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=sablab-gpu
 #SBATCH --gres=gpu:a40:1
-#SBATCH --mem=30G
+#SBATCH --mem=60G
 #SBATCH --cpus-per-task=4
 #SBATCH --job-name=breast_stage3
 #SBATCH --output=slurm_stage3_%j.out
@@ -15,6 +15,9 @@
 
 set -e  # Exit on error
 
+# Change to project directory
+cd /midtier/sablab/scratch/hoc4008/breast-sub-gen
+
 echo "=========================================="
 echo "Stage 3.3: Shallow Edge Refinement"
 echo "=========================================="
@@ -27,6 +30,7 @@ if [ ! -f "models/breast_controlnet_stage2_best.pt" ]; then
     exit 1
 fi
 
+eval "$(conda shell.bash hook)"
 conda activate breast_gen
 
 python -m scripts.train_controlnet \

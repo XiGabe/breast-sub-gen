@@ -311,14 +311,70 @@ def prepare_maisi_controlnet_json_dataloader(
         list_valid = []
         for data_list, data_root in zip(json_data_list, data_base_dir):
             with open(data_list, "r") as f:
-                json_data = json.load(f)["training"]
-            train, val = add_data_dir2path(json_data, data_root, fold)
-            list_train += train
-            list_valid += val
+                json_data_full = json.load(f)
+
+            # Check if JSON has separate 'training' and 'validation' keys
+            if "validation" in json_data_full and len(json_data_full.get("validation", [])) > 0:
+                # Use pre-split training and validation data from JSON
+                train_data = json_data_full["training"]
+                val_data = json_data_full["validation"]
+
+                # Add data directory prefix to training data
+                for d in train_data:
+                    d["image"] = os.path.join(data_root, d["image"])
+                    if "label" in d:
+                        d["label"] = os.path.join(data_root, d["label"])
+                    if "pre" in d:
+                        d["pre"] = os.path.join(data_root, d["pre"])
+
+                # Add data directory prefix to validation data
+                for d in val_data:
+                    d["image"] = os.path.join(data_root, d["image"])
+                    if "label" in d:
+                        d["label"] = os.path.join(data_root, d["label"])
+                    if "pre" in d:
+                        d["pre"] = os.path.join(data_root, d["pre"])
+
+                list_train += train_data
+                list_valid += val_data
+            else:
+                # Fallback to fold-based splitting (old behavior)
+                json_data = json_data_full["training"]
+                train, val = add_data_dir2path(json_data, data_root, fold)
+                list_train += train
+                list_valid += val
     else:
         with open(json_data_list, "r") as f:
-            json_data = json.load(f)["training"]
-        list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
+            json_data_full = json.load(f)
+
+        # Check if JSON has separate 'training' and 'validation' keys
+        if "validation" in json_data_full and len(json_data_full.get("validation", [])) > 0:
+            # Use pre-split training and validation data from JSON
+            train_data = json_data_full["training"]
+            val_data = json_data_full["validation"]
+
+            # Add data directory prefix to training data
+            for d in train_data:
+                d["image"] = os.path.join(data_base_dir, d["image"])
+                if "label" in d:
+                    d["label"] = os.path.join(data_base_dir, d["label"])
+                if "pre" in d:
+                    d["pre"] = os.path.join(data_base_dir, d["pre"])
+
+            # Add data directory prefix to validation data
+            for d in val_data:
+                d["image"] = os.path.join(data_base_dir, d["image"])
+                if "label" in d:
+                    d["label"] = os.path.join(data_base_dir, d["label"])
+                if "pre" in d:
+                    d["pre"] = os.path.join(data_base_dir, d["pre"])
+
+            list_train = train_data
+            list_valid = val_data
+        else:
+            # Fallback to fold-based splitting (old behavior)
+            json_data = json_data_full["training"]
+            list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
 
     # Common transforms applied to both train and val
     # NO spatial augmentation (no crop, flip, rotate, zoom, etc.) to maintain alignment

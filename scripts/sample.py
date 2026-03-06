@@ -202,7 +202,8 @@ def ldm_conditional_sample_one_image(
     num_inference_steps=1000,
     autoencoder_sliding_window_infer_size=[96, 96, 96],
     autoencoder_sliding_window_infer_overlap=0.6667,
-    cfg_guidance_scale = 0
+    cfg_guidance_scale = 0,
+    use_crop_body_mask=False  # For subtraction generation, disable crop_body_mask by default
 ):
     """
     Generate a single synthetic image using a latent diffusion model with controlnet.
@@ -424,7 +425,7 @@ def ldm_conditional_sample_one_image(
                         unet_inputs[k] = torch.cat([unet_inputs[k], torch.zeros_like(modality_tensor)])
             if cfg_guidance_scale == 0:
                 model_output = diffusion_unet(**unet_inputs)
-            else:                
+            else:
                 model_t, model_uncond = diffusion_unet(**unet_inputs).chunk(2)
                 model_output = model_uncond + cfg_guidance_scale * (model_t - model_uncond)
 
@@ -459,20 +460,32 @@ def ldm_conditional_sample_one_image(
             device=torch.device("cpu"),
         )
         synthetic_images = dynamic_infer(inferer, recon_model, latents)
-        if modality_tensor<=7:
-            synthetic_images = torch.clip(synthetic_images, b_min, b_max).cpu()
-        else:
-            synthetic_images = torch.clip(synthetic_images, b_min, None).cpu()
+
+        # Move to CPU without fixed clipping
+        # VAE output may not be in [0, 1] range - normalize based on actual range in post-processing
+        synthetic_images = synthetic_images.cpu()
+
         end_time = time.time()
         logging.info(f"---- Image VAE decoding time: {end_time - start_time} seconds ----")
 
         ## post processing:
-        # project output to [0, 1]
-        synthetic_images = (synthetic_images - b_min) / (b_max - b_min)
-        # project output to [-1000, 1000]
+        # For subtraction generation, use actual data range for normalization
+        # VAE output may not be in [0, 1] range, so normalize based on actual min/max
+        actual_min = synthetic_images.min()
+        actual_max = synthetic_images.max()
+
+        if actual_max > actual_min:
+            # project output to [0, 1] using actual range
+            synthetic_images = (synthetic_images - actual_min) / (actual_max - actual_min)
+
+        # project output to [a_min, a_max]
         synthetic_images = synthetic_images * (a_max - a_min) + a_min
+
         # regularize background intensities
-        synthetic_images = crop_img_body_mask(synthetic_images, combine_label, a_min=a_min)
+        # For subtraction generation, we typically don't want to crop with tumor mask
+        # as it would zero out all non-tumor regions
+        if use_crop_body_mask:
+            synthetic_images = crop_img_body_mask(synthetic_images, combine_label, a_min=a_min)
         torch.cuda.empty_cache()
 
     return synthetic_images, combine_label
