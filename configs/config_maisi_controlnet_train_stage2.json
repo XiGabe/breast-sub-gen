@@ -4,7 +4,7 @@
         "cache_rate": 0.0,
         "fold": 0,
         "lr": 5e-5,
-        "n_epochs": 50,
+        "n_epochs": 70,
         "unet_blocks_to_unfreeze": [
             "down_blocks.2",
             "down_blocks.3",
@@ -14,9 +14,9 @@
             "up_blocks.2",
             "up_blocks.3"
         ],
-        "unet_lr": 5e-5,
+        "unet_lr": 3e-5,
         "disable_inplace_for_checkpointing": true,
-        "validation_frequency": 2,
+        "validation_frequency": 1,
         "weighted_loss_label": [129],
         "weighted_loss": 100
     },

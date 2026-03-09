@@ -131,10 +131,55 @@ def decode_with_vae(vae, latents, scale_factor, device, infer_size=[80, 80, 32],
     # For MRI: clip to [0, 1] range (autoencoder output range)
     decoded = torch.clip(decoded, 0.0, 1.0)
 
-    # Project to [0, 1000] MRI intensity range
-    decoded = decoded * 1000.0
+    # Keep in [0, 1] range for NIfTI output (removed * 1000.0 scaling)
 
     return decoded
+
+
+def save_nifti_with_metadata(data, sample_id, output_dir, data_type="generated_sub",
+                             reference_nii_path=None, logger=None):
+    """Save numpy array as NIfTI file with proper affine and spacing metadata."""
+    import nibabel as nib
+    import os
+
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"{sample_id}_{data_type}.nii.gz"
+    output_path = os.path.join(output_dir, filename)
+
+    # Get affine from reference if available
+    if reference_nii_path and os.path.exists(reference_nii_path):
+        try:
+            ref_nii = nib.load(reference_nii_path)
+            affine = ref_nii.affine
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to load reference NIfTI: {e}, using default affine")
+            affine = _get_standard_affine()
+    else:
+        affine = _get_standard_affine()
+
+    # Ensure data is float32
+    data = data.astype(np.float32)
+
+    # Create and save NIfTI image
+    nii_img = nib.Nifti1Image(data, affine=affine)
+    nib.save(nii_img, output_path)
+
+    if logger:
+        logger.info(f"  ✓ Saved NIfTI: {output_path} [range: {data.min():.4f}, {data.max():.4f}]")
+
+    return output_path
+
+
+def _get_standard_affine():
+    """Get standard affine matrix for breast MRI data.
+    Standard spacing: [1.2, 0.7, 0.7] mm³
+    """
+    affine = np.eye(4)
+    affine[0, 0] = 0.7  # Row spacing
+    affine[1, 1] = 0.7  # Column spacing
+    affine[2, 2] = 1.2  # Slice spacing
+    return affine
 
 
 def create_comparison_visualization(
@@ -518,6 +563,31 @@ def main(
                     logger.info(f"  ✓ Ground truth decoded successfully")
                 except Exception as e:
                     logger.warning(f"  ⚠ Ground truth decoding failed (continuing without GT): {str(e)[:100]}")
+
+                # ========== Save NIfTI files ==========
+                nifti_output_dir = os.path.join(args.output_dir, "nifti_outputs")
+                os.makedirs(nifti_output_dir, exist_ok=True)
+
+                # Try to get reference pre-contrast path for metadata
+                reference_pre_path = None
+                if "pre" in batch and hasattr(batch["pre"], "meta"):
+                    meta = batch["pre"].meta
+                    if "filename_or_obj" in meta:
+                        reference_pre_path = meta["filename_or_obj"]
+                        if isinstance(reference_pre_path, (list, tuple)):
+                            reference_pre_path = reference_pre_path[0] if len(reference_pre_path) > 0 else None
+
+                # Save generated subtraction
+                save_nifti_with_metadata(gen_sub_np, sample_id, nifti_output_dir, "generated_sub", reference_pre_path, logger)
+
+                # Save ground truth (if available)
+                if gt_sub_np is not None:
+                    save_nifti_with_metadata(gt_sub_np, sample_id, nifti_output_dir, "gt_sub", reference_pre_path, logger)
+
+                # Save pre-contrast and mask for reference
+                save_nifti_with_metadata(pre_np, sample_id, nifti_output_dir, "pre", reference_pre_path, logger)
+                save_nifti_with_metadata(mask_np, sample_id, nifti_output_dir, "mask", reference_pre_path, logger)
+                # ========== End NIfTI saving ==========
 
                 # Create visualizations for each view
                 for view in ["axial", "sagittal", "coronal"]:

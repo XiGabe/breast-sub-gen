@@ -259,9 +259,9 @@ def ldm_conditional_sample_one_image(
         b_min = 0.0
         b_max = 1
     else:
-        # MRI image intensity range
+        # MRI image intensity range - output in [0, 1] for NIfTI files
         a_min = 0
-        a_max = 1000
+        a_max = 1.0
         # autoencoder output intensity range
         b_min = 0.0
         b_max = 1

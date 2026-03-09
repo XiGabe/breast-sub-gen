@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from monai.networks.utils import copy_model_state
 from monai.utils import RankFilter
 # Removed MONAI morphology ops - using pure PyTorch implementations for stability
@@ -170,7 +171,8 @@ def compute_model_output(
     modality_tensor=None,
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
-    return_controlnet_blocks=False
+    return_controlnet_blocks=False,
+    use_checkpoint=False
 ):
     """
     Run ControlNet + U-Net to obtain the denoising network output (and optionally
@@ -288,7 +290,22 @@ def compute_model_output(
                 "class_labels": modality_tensor,
             }
         )
-    model_output = unet(**unet_inputs)
+    # Use gradient checkpointing for U-Net to avoid inplace operation errors with mixed frozen/unfrozen params
+    if use_checkpoint:
+        # Create a custom forward function for checkpointing that matches the U-Net signature
+        class CheckpointedUNet(torch.nn.Module):
+            def __init__(self, unet_module, unet_kwargs):
+                super().__init__()
+                self.unet = unet_module
+                self.kwargs = unet_kwargs
+
+            def forward(self):
+                return self.unet(**self.kwargs)
+
+        checkpointed_unet = CheckpointedUNet(unet, unet_inputs)
+        model_output = checkpoint(checkpointed_unet.forward, use_reentrant=False)
+    else:
+        model_output = unet(**unet_inputs)
     if return_controlnet_blocks:
         return model_output, down_block_res_samples, mid_block_res_sample
     else:
@@ -398,6 +415,10 @@ def train_controlnet(
 
     if use_ddp:
         controlnet = DDP(controlnet, device_ids=[device], output_device=rank, find_unused_parameters=True)
+        # Wrap U-Net in DDP if any parameters are unfrozen (Stage 2 or 3)
+        if any(p.requires_grad for p in unet.parameters()):
+            unet = DDP(unet, device_ids=[device], output_device=rank, find_unused_parameters=True)
+            logger.info("U-Net wrapped in DDP for gradient synchronization")
 
     # set data loader
     if include_modality:
@@ -427,6 +448,23 @@ def train_controlnet(
     validation_freq = args.controlnet_train.get("validation_frequency", 1)  # Validate every N epochs
     if validation_enabled:
         logger.info(f"Validation enabled: every {validation_freq} epoch(s)")
+        logger.info(f"Validation dataloader created with {len(val_loader)} batches")
+        # Validation sanity check: inspect first batch for data issues
+        try:
+            sanity_batch = next(iter(val_loader))
+            logger.info(f"Validation sanity check - batch keys: {list(sanity_batch.keys())}")
+            for key in ["image", "label", "pre"]:
+                if key in sanity_batch:
+                    data = sanity_batch[key]
+                    has_nan = torch.isnan(data).any().item()
+                    has_inf = torch.isinf(data).any().item()
+                    logger.info(f"  {key}: shape={data.shape}, range=[{data.min():.4f}, {data.max():.4f}], NaN={has_nan}, Inf={has_inf}")
+                    if has_nan:
+                        logger.error(f"VALIDATION DATA ERROR: {key} contains NaN values!")
+                    if has_inf:
+                        logger.error(f"VALIDATION DATA ERROR: {key} contains Inf values!")
+        except Exception as e:
+            logger.warning(f"Validation sanity check failed: {e}")
     else:
         logger.info("No validation set - using training loss for checkpoint selection")
 
@@ -436,9 +474,10 @@ def train_controlnet(
 
     # Add U-Net parameters if any are unfrozen
     unet_lr = args.controlnet_train.get("unet_lr", None)
-    if unet_lr and any(p.requires_grad for p in unet.parameters()):
+    unet_to_check = unet.module if world_size > 1 else unet
+    if unet_lr and any(p.requires_grad for p in unet_to_check.parameters()):
         # Get unfrozen U-Net parameters
-        unet_params = [p for p in unet.parameters() if p.requires_grad]
+        unet_params = [p for p in unet_to_check.parameters() if p.requires_grad]
         params.append({"params": unet_params, "lr": unet_lr})
         logger.info(f"Two-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}, U-Net LR={unet_lr:.2e}")
     else:
@@ -448,10 +487,27 @@ def train_controlnet(
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
 
-    lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=total_steps, power=2.0)
+    # Improved learning rate scheduler: Warmup + Cosine Annealing
+    from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
+    n_epochs = args.controlnet_train["n_epochs"]
+    warmup_epochs = max(1, int(n_epochs * 0.05))  # 5% of epochs for warmup
+    warmup_steps = warmup_epochs * len(train_loader)
+    main_scheduler_steps = total_steps - warmup_steps
+
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_scheduler_steps, eta_min=0.0)
+
+    lr_scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
+    )
+    logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs)")
 
     # Step 4: training
     n_epochs = args.controlnet_train["n_epochs"]
+    start_epoch = getattr(args, "start_epoch", 1)  # Global epoch starting number (for multi-stage training)
     scaler = GradScaler("cuda")
     total_step = 0
     best_loss = 1e4
@@ -460,7 +516,10 @@ def train_controlnet(
     unet.eval()
     prev_time = time.time()
     for epoch in range(n_epochs):
+        global_epoch = start_epoch + epoch  # Global epoch number for logging
         epoch_loss_ = 0
+        epoch_l1_loss_ = 0
+        epoch_bg_loss_ = 0
         valid_batches = 0  # Track number of valid (non-NaN) batches
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -510,7 +569,8 @@ def train_controlnet(
                     modality_tensor=modality_tensor,
                     top_region_index_tensor=top_region_index_tensor,
                     bottom_region_index_tensor=bottom_region_index_tensor,
-                    return_controlnet_blocks=False
+                    return_controlnet_blocks=False,
+                    use_checkpoint=True  # Enable gradient checkpointing to avoid inplace errors
                 )
 
                 if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
@@ -567,7 +627,7 @@ def train_controlnet(
             if not torch.isfinite(loss):
                 # Log warning and skip this batch
                 logger.warning(
-                    f"NaN or Inf loss detected at [Epoch {epoch + 1}/{n_epochs}] [Batch {step + 1}/{len(train_loader)}]. "
+                    f"NaN or Inf loss detected at [Epoch {global_epoch}/{start_epoch + n_epochs - 1}] [Batch {step + 1}/{len(train_loader)}]. "
                     f"Skipping this batch."
                 )
                 # Check if inputs have NaN
@@ -585,6 +645,11 @@ def train_controlnet(
             lr_scheduler.step()
             total_step += 1
             valid_batches += 1  # Increment valid batch counter
+
+            # Track epoch-level loss components for CSV logging
+            epoch_loss_ += loss.detach()
+            epoch_l1_loss_ += l1_loss.detach()
+            epoch_bg_loss_ += bg_penalty_loss.detach()
 
             if rank == 0:
                 # write train loss for each batch into tensorboard
@@ -606,8 +671,8 @@ def train_controlnet(
                 print(
                     "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s "
                     % (
-                        epoch + 1,
-                        n_epochs,
+                        global_epoch,
+                        start_epoch + n_epochs - 1,
                         step + 1,
                         len(train_loader),
                         lr_scheduler.get_last_lr()[0],
@@ -624,8 +689,8 @@ def train_controlnet(
                     logger.info(
                         "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Total: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s"
                         % (
-                            epoch + 1,
-                            n_epochs,
+                            global_epoch,
+                            start_epoch + n_epochs - 1,
                             step + 1,
                             len(train_loader),
                             lr_scheduler.get_last_lr()[0],
@@ -635,14 +700,15 @@ def train_controlnet(
                             time_left,
                         )
                     )
-            epoch_loss_ += loss.detach()
 
         # Calculate epoch average, accounting for skipped batches
         if valid_batches > 0:
             epoch_loss = epoch_loss_ / valid_batches
+            epoch_l1_loss = epoch_l1_loss_ / valid_batches
+            epoch_bg_loss = epoch_bg_loss_ / valid_batches
         else:
             # All batches were skipped (NaN), use previous loss or skip this epoch
-            logger.warning(f"[Epoch {epoch + 1}/{n_epochs}] All batches skipped due to NaN loss!")
+            logger.warning(f"[Epoch {global_epoch}/{start_epoch + n_epochs - 1}] All batches skipped due to NaN loss!")
             epoch_loss = torch.tensor(0.0)  # Placeholder
 
         # Print newline and summary after epoch
@@ -650,7 +716,7 @@ def train_controlnet(
             print()  # newline after progress bar
             if valid_batches < len(train_loader):
                 logger.info(
-                    f"[Epoch {epoch + 1}/{n_epochs}] Skipped {len(train_loader) - valid_batches}/{len(train_loader)} batches due to NaN loss"
+                    f"[Epoch {global_epoch}/{start_epoch + n_epochs - 1}] Skipped {len(train_loader) - valid_batches}/{len(train_loader)} batches due to NaN loss"
                 )
 
         if use_ddp:
@@ -662,108 +728,163 @@ def train_controlnet(
 
             # Validation loop (if enabled)
             val_loss = None
-            if validation_enabled and val_loader is not None and (epoch + 1) % validation_freq == 0:
-                logger.info(f"Running validation at epoch {epoch + 1}...")
+            val_l1_loss = None
+            val_bg_loss = None
+            if validation_enabled and val_loader is not None and (global_epoch % validation_freq == 0):
+                logger.info(f"Running validation at epoch {global_epoch}...")
                 controlnet.eval()
                 val_loss_ = 0
+                val_l1_loss_ = 0
+                val_bg_loss_ = 0
                 val_valid_batches = 0
+                val_skipped_batches = 0
+                val_skip_reasons = {"missing_keys": 0, "nan_inputs": 0, "nan_loss": 0, "other": 0}
 
                 with torch.no_grad():
                     for val_step, val_batch in enumerate(val_loader):
-                        # Check if all required keys exist
-                        if "image" not in val_batch:
-                            logger.warning(f"[Validation Batch {val_step}] Missing 'image' key in val_batch. Keys: {list(val_batch.keys())}")
-                            continue
-                        if "label" not in val_batch:
-                            logger.warning(f"[Validation Batch {val_step}] Missing 'label' key in val_batch. Keys: {list(val_batch.keys())}")
-                            continue
-                        if "pre" not in val_batch:
-                            logger.warning(f"[Validation Batch {val_step}] Missing 'pre' key in val_batch. Keys: {list(val_batch.keys())}")
-                            continue
+                        try:
+                            # Check if all required keys exist
+                            if "image" not in val_batch:
+                                logger.warning(f"[Val Batch {val_step}] Missing 'image' key. Keys: {list(val_batch.keys())}")
+                                val_skipped_batches += 1
+                                val_skip_reasons["missing_keys"] += 1
+                                continue
+                            if "label" not in val_batch:
+                                logger.warning(f"[Val Batch {val_step}] Missing 'label' key. Keys: {list(val_batch.keys())}")
+                                val_skipped_batches += 1
+                                val_skip_reasons["missing_keys"] += 1
+                                continue
+                            if "pre" not in val_batch:
+                                logger.warning(f"[Val Batch {val_step}] Missing 'pre' key. Keys: {list(val_batch.keys())}")
+                                val_skipped_batches += 1
+                                val_skip_reasons["missing_keys"] += 1
+                                continue
 
-                        val_images = val_batch["image"].to(device) * scale_factor
-                        val_labels = val_batch["label"].to(device)
-                        val_spacing_tensor = val_batch["spacing"].to(device)
-                        val_pre_images = val_batch["pre"].to(device)
-                        val_modality_tensor = val_batch["modality"].to(device) if include_modality else None
+                            val_images = val_batch["image"].to(device) * scale_factor
+                            val_labels = val_batch["label"].to(device)
+                            val_spacing_tensor = val_batch["spacing"].to(device)
+                            val_pre_images = val_batch["pre"].to(device)
+                            val_modality_tensor = val_batch["modality"].to(device) if include_modality else None
 
-                        # Check for NaN in inputs
-                        if torch.isnan(val_images).any():
-                            logger.warning(f"[Validation Batch {val_step}] val_images contains NaN!")
-                            continue
-                        if torch.isnan(val_labels).any():
-                            logger.warning(f"[Validation Batch {val_step}] val_labels contains NaN!")
-                            continue
-                        if torch.isnan(val_pre_images).any():
-                            logger.warning(f"[Validation Batch {val_step}] val_pre_images contains NaN!")
-                            continue
+                            # Check for NaN in inputs
+                            if torch.isnan(val_images).any():
+                                logger.warning(f"[Val Batch {val_step}] val_images contains NaN!")
+                                val_skipped_batches += 1
+                                val_skip_reasons["nan_inputs"] += 1
+                                continue
+                            if torch.isnan(val_labels).any():
+                                logger.warning(f"[Val Batch {val_step}] val_labels contains NaN!")
+                                val_skipped_batches += 1
+                                val_skip_reasons["nan_inputs"] += 1
+                                continue
+                            if torch.isnan(val_pre_images).any():
+                                logger.warning(f"[Val Batch {val_step}] val_pre_images contains NaN!")
+                                val_skipped_batches += 1
+                                val_skip_reasons["nan_inputs"] += 1
+                                continue
 
-                        val_noise = torch.randn_like(val_images)
-                        if isinstance(noise_scheduler, RFlowScheduler):
-                            val_timesteps = noise_scheduler.sample_timesteps(val_images)
-                        else:
-                            val_timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device).long()
-
-                        with autocast("cuda", enabled=True):
-                            val_model_output, _, _ = compute_model_output(
-                                val_images, val_labels, val_noise, val_timesteps, noise_scheduler,
-                                controlnet, unet, val_spacing_tensor,
-                                pre_images=val_pre_images,
-                                apply_morphological_perturb=False,  # No augmentation during validation
-                                modality_tensor=val_modality_tensor,
-                            )
-
-                            if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
-                                val_model_gt = val_noise
-                            elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
-                                val_model_gt = val_images
-                            elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
-                                val_model_gt = val_images - val_noise
+                            val_noise = torch.randn_like(val_images)
+                            if isinstance(noise_scheduler, RFlowScheduler):
+                                val_timesteps = noise_scheduler.sample_timesteps(val_images)
                             else:
-                                raise ValueError(f"Unknown prediction type: {noise_scheduler.prediction_type}")
+                                val_timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device).long()
 
-                            # Same loss computation as training, but separate components
-                            val_roi_mask_latent = F.max_pool3d(val_labels.float(), kernel_size=4, stride=4) > 0.0
-                            val_weights = torch.ones_like(val_model_output)
-                            val_weights[val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)] = 3.0
-                            val_l1_loss_raw = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
-                            val_l1_loss = (val_l1_loss_raw * val_weights).mean()
+                            with autocast("cuda", enabled=True):
+                                val_model_output, _, _ = compute_model_output(
+                                    val_images, val_labels, val_noise, val_timesteps, noise_scheduler,
+                                    controlnet, unet, val_spacing_tensor,
+                                    pre_images=val_pre_images,
+                                    apply_morphological_perturb=False,  # No augmentation during validation
+                                    modality_tensor=val_modality_tensor,
+                                    use_checkpoint=True  # Enable gradient checkpointing to avoid inplace errors
+                                )
 
-                            if val_roi_mask_latent.sum() > 0:
-                                val_bg_mask_expanded = (~val_roi_mask_latent).repeat(1, val_model_output.shape[1], 1, 1, 1)
-                            else:
-                                val_bg_mask_expanded = torch.ones_like(val_model_output, dtype=torch.bool)
+                                if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                                    val_model_gt = val_noise
+                                elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                                    val_model_gt = val_images
+                                elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
+                                    val_model_gt = val_images - val_noise
+                                else:
+                                    raise ValueError(f"Unknown prediction type: {noise_scheduler.prediction_type}")
 
-                            val_pred_bg = val_model_output.float()[val_bg_mask_expanded]
-                            val_gt_bg = val_model_gt.float()[val_bg_mask_expanded]
-                            val_false_positive_bg = F.relu(val_pred_bg - val_gt_bg)
-                            val_bg_penalty_loss = 5.0 * (val_false_positive_bg ** 2).mean()
+                                # Same loss computation as training, but separate components
+                                val_roi_mask_latent = F.max_pool3d(val_labels.float(), kernel_size=4, stride=4) > 0.0
+                                val_weights = torch.ones_like(val_model_output)
+                                val_weights[val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)] = 3.0
+                                val_l1_loss_raw = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
+                                val_l1_loss = (val_l1_loss_raw * val_weights).mean()
 
-                            # Total validation loss
-                            val_loss = val_l1_loss + val_bg_penalty_loss
+                                if val_roi_mask_latent.sum() > 0:
+                                    val_bg_mask_expanded = (~val_roi_mask_latent).repeat(1, val_model_output.shape[1], 1, 1, 1)
+                                else:
+                                    val_bg_mask_expanded = torch.ones_like(val_model_output, dtype=torch.bool)
 
-                        # Check for NaN or Inf loss
-                        if not torch.isfinite(val_loss):
-                            logger.warning(
-                                f"[Validation Batch {val_step}] NaN or Inf loss detected! "
-                                f"loss={val_loss}. Skipping this batch."
-                            )
-                            if torch.isnan(val_model_output).any():
-                                logger.warning(f"  -> val_model_output contains NaN!")
-                            if torch.isnan(val_model_gt).any():
-                                logger.warning(f"  -> val_model_gt contains NaN!")
+                                val_pred_bg = val_model_output.float()[val_bg_mask_expanded]
+                                val_gt_bg = val_model_gt.float()[val_bg_mask_expanded]
+                                val_false_positive_bg = F.relu(val_pred_bg - val_gt_bg)
+                                val_bg_penalty_loss = 5.0 * (val_false_positive_bg ** 2).mean()
+
+                                # Total validation loss
+                                val_loss = val_l1_loss + val_bg_penalty_loss
+
+                            # Check for NaN or Inf loss
+                            if not torch.isfinite(val_loss):
+                                logger.warning(
+                                    f"[Val Batch {val_step}] NaN/Inf loss! loss={val_loss:.4f}"
+                                )
+                                if torch.isnan(val_model_output).any():
+                                    logger.warning(f"  -> val_model_output contains NaN!")
+                                if torch.isnan(val_model_gt).any():
+                                    logger.warning(f"  -> val_model_gt contains NaN!")
+                                val_skipped_batches += 1
+                                val_skip_reasons["nan_loss"] += 1
+                                continue
+
+                            val_loss_ += val_loss.detach()
+                            val_l1_loss_ += val_l1_loss.detach()
+                            val_bg_loss_ += val_bg_penalty_loss.detach()
+                            val_valid_batches += 1
+
+                            # Log progress every 10 batches
+                            if (val_step + 1) % 10 == 0:
+                                logger.info(
+                                    f"  [Val Batch {val_step + 1}/{len(val_loader)}] "
+                                    f"Total={val_loss:.4f}, L1={val_l1_loss:.4f}, BgPen={val_bg_penalty_loss:.4f}"
+                                )
+
+                        except Exception as e:
+                            logger.error(f"[Val Batch {val_step}] Exception: {e}")
+                            val_skipped_batches += 1
+                            val_skip_reasons["other"] += 1
                             continue
 
-                        val_loss_ += val_loss.detach()
-                        val_valid_batches += 1
-
+                # Validation summary
                 if val_valid_batches > 0:
                     val_loss = val_loss_ / val_valid_batches
-                    logger.info(f"[Epoch {epoch + 1}] Validation loss: {val_loss:.4f}")
+                    val_l1_loss = val_l1_loss_ / val_valid_batches
+                    val_bg_loss = val_bg_loss_ / val_valid_batches
+                    logger.info(
+                        f"[Epoch {global_epoch}] Validation COMPLETE: "
+                        f"Total={val_loss:.4f}, L1={val_l1_loss:.4f}, BgPen={val_bg_loss:.4f} "
+                        f"({val_valid_batches} batches"
+                    )
+                    if val_skipped_batches > 0:
+                        logger.info(
+                            f"  Skipped: {val_skipped_batches} batches - "
+                            f"reasons: {val_skip_reasons}"
+                        )
                     tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", val_loss.cpu().item(), total_step)
+                    tensorboard_writer.add_scalar("val/val_l1_loss_epoch", val_l1_loss.cpu().item(), total_step)
+                    tensorboard_writer.add_scalar("val/val_bg_penalty_loss_epoch", val_bg_loss.cpu().item(), total_step)
                 else:
-                    logger.warning(f"[Epoch {epoch + 1}] All validation batches skipped!")
+                    logger.warning(
+                        f"[Epoch {global_epoch}] All validation batches skipped! "
+                        f"Skip reasons: {val_skip_reasons}"
+                    )
                     val_loss = None
+                    val_l1_loss = None
+                    val_bg_loss = None
 
                 controlnet.train()
 
@@ -772,14 +893,16 @@ def train_controlnet(
 
             # Save U-Net state if any blocks are unfrozen
             unet_state_dict = None
-            if any(p.requires_grad for p in unet.parameters()):
+            unet_to_check = unet.module if world_size > 1 else unet
+            if any(p.requires_grad for p in unet_to_check.parameters()):
                 unet_state_dict = unet.module.state_dict() if world_size > 1 else unet.state_dict()
 
-            # Save per-epoch checkpoint
-            epoch_checkpoint_path = f"{args.model_dir}/{args.exp_name}_epoch_{epoch + 1}.pt"
+            # Save per-epoch checkpoint (use local epoch+1 for filename, global_epoch for saved field)
+            local_epoch = epoch + 1
+            epoch_checkpoint_path = f"{args.model_dir}/{args.exp_name}_epoch_{local_epoch}.pt"
             torch.save(
                 {
-                    "epoch": epoch + 1,
+                    "epoch": global_epoch,  # Save global epoch number
                     "train_loss": epoch_loss,
                     "val_loss": val_loss,
                     "controlnet_state_dict": controlnet_state_dict,
@@ -788,7 +911,7 @@ def train_controlnet(
                 },
                 epoch_checkpoint_path,
             )
-            logger.info(f"Saved epoch {epoch + 1} checkpoint to {epoch_checkpoint_path}")
+            logger.info(f"Saved epoch {global_epoch} checkpoint to {epoch_checkpoint_path}")
 
             # Update best checkpoint based on validation loss (if available) or training loss
             loss_for_best = val_loss if val_loss is not None else epoch_loss
@@ -797,7 +920,7 @@ def train_controlnet(
                 best_checkpoint_path = f"{args.model_dir}/{args.exp_name}_best.pt"
                 torch.save(
                     {
-                        "epoch": epoch + 1,
+                        "epoch": global_epoch,  # Save global epoch number
                         "train_loss": epoch_loss,
                         "val_loss": val_loss,
                         "controlnet_state_dict": controlnet_state_dict,
@@ -806,7 +929,7 @@ def train_controlnet(
                     },
                     best_checkpoint_path,
                 )
-                logger.info(f"New best {'validation' if val_loss is not None else 'training'} loss: {best_loss:.4f} -> {best_checkpoint_path}")
+                logger.info(f"New best {'validation' if val_loss is not None else 'training'} loss: {best_loss:.4f} at epoch {global_epoch} -> {best_checkpoint_path}")
 
         torch.cuda.empty_cache()
     if use_ddp:
