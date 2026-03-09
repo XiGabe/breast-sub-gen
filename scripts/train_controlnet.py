@@ -518,8 +518,6 @@ def train_controlnet(
     for epoch in range(n_epochs):
         global_epoch = start_epoch + epoch  # Global epoch number for logging
         epoch_loss_ = 0
-        epoch_l1_loss_ = 0
-        epoch_bg_loss_ = 0
         valid_batches = 0  # Track number of valid (non-NaN) batches
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -588,41 +586,29 @@ def train_controlnet(
                         f"[{DDPMPredictionType.EPSILON},{DDPMPredictionType.SAMPLE},{DDPMPredictionType.V_PREDICTION}]",
                     )
     
-                # ========== The Great Cleanup: Pure Loss Implementation ==========
+                # ========== Pure Weighted L1 Loss (MAISI Official Implementation) ==========
                 # 1. Precise dimension reduction using Max Pooling (preserves ANY tiny lesion!)
                 # labels: [B, 1, 256, 256, 256] -> roi_mask_latent: [B, 1, 64, 64, 64]
                 roi_mask_latent = F.max_pool3d(labels.float(), kernel_size=4, stride=4) > 0.0
 
-                # 2. Base Global L1 with moderate ROI weighting
-                weights = torch.ones_like(model_output)
-                weights[roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)] = 3.0
-                l1_loss_raw = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
-                l1_loss = (l1_loss_raw * weights).mean()
+                # 2. Compute L1 loss for ALL voxels (reduction="none" for per-voxel weighting)
+                # L1 Loss aligns with MAISI official implementation for medical imaging
+                # Better preserves high-frequency edges (organ boundaries, tumor contours)
+                raw_l1_loss = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
 
-                # 3. Absolute Background Penalty (严查假阳性糊团)
-                # Penalize false positives in background regions to suppress snow noise
+                # 3. Apply ROI weighting
+                # - Background: weight = 1.0 (standard diffusion loss - preserves vessels!)
+                # - Tumor ROI: weight = 5.0 (high priority on tumor accuracy)
+                weight_mask = torch.ones_like(raw_l1_loss)
                 if roi_mask_latent.sum() > 0:
-                    # Has tumor: background = ~roi
-                    bg_mask_expanded = (~roi_mask_latent).repeat(1, model_output.shape[1], 1, 1, 1)
-                else:
-                    # No tumor: entire image is background
-                    bg_mask_expanded = torch.ones_like(model_output, dtype=torch.bool)
+                    roi_mask_expanded = roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)
+                    weight_mask[roi_mask_expanded] = 5.0
 
-                pred_bg = model_output.float()[bg_mask_expanded]
-                gt_bg = model_gt.float()[bg_mask_expanded]
-
-                # Only penalize false positives (white spots that shouldn't be there)
-                # F.relu(pred - gt) = max(0, pred - gt): only positive when pred > gt
-                false_positive_bg = F.relu(pred_bg - gt_bg)
-                bg_penalty_loss = 5.0 * (false_positive_bg ** 2).mean()
-
-                # Total loss
-                loss = l1_loss + bg_penalty_loss
+                # 4. Final weighted loss
+                loss = (raw_l1_loss * weight_mask).mean()
 
             # Check for NaN loss before backward pass
             loss_value = loss.detach().cpu().item()
-            l1_loss_value = l1_loss.detach().cpu().item()
-            bg_penalty_value = bg_penalty_loss.detach().cpu().item()
 
             if not torch.isfinite(loss):
                 # Log warning and skip this batch
@@ -646,21 +632,13 @@ def train_controlnet(
             total_step += 1
             valid_batches += 1  # Increment valid batch counter
 
-            # Track epoch-level loss components for CSV logging
+            # Track epoch-level loss for CSV logging
             epoch_loss_ += loss.detach()
-            epoch_l1_loss_ += l1_loss.detach()
-            epoch_bg_loss_ += bg_penalty_loss.detach()
 
             if rank == 0:
                 # write train loss for each batch into tensorboard
                 tensorboard_writer.add_scalar(
                     "train/train_controlnet_loss_iter", loss_value, total_step
-                )
-                tensorboard_writer.add_scalar(
-                    "train/l1_loss_iter", l1_loss_value, total_step
-                )
-                tensorboard_writer.add_scalar(
-                    "train/bg_penalty_loss_iter", bg_penalty_value, total_step
                 )
                 batches_done = step + 1
                 batches_left = len(train_loader) - batches_done
@@ -669,7 +647,7 @@ def train_controlnet(
 
                 # Console output: every batch (for real-time monitoring)
                 print(
-                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s "
+                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
                     % (
                         global_epoch,
                         start_epoch + n_epochs - 1,
@@ -677,8 +655,6 @@ def train_controlnet(
                         len(train_loader),
                         lr_scheduler.get_last_lr()[0],
                         loss_value,
-                        l1_loss_value,
-                        bg_penalty_value,
                         time_left,
                     ),
                     end="", flush=True
@@ -687,7 +663,7 @@ def train_controlnet(
                 # File output: every 100 batches (to keep log file manageable)
                 if (step + 1) % 100 == 0 or (step + 1) == len(train_loader):
                     logger.info(
-                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Total: %.4f] [L1: %.4f] [BgPen: %.4f] ETA: %s"
+                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Loss: %.4f] ETA: %s"
                         % (
                             global_epoch,
                             start_epoch + n_epochs - 1,
@@ -695,8 +671,6 @@ def train_controlnet(
                             len(train_loader),
                             lr_scheduler.get_last_lr()[0],
                             loss_value,
-                            l1_loss_value,
-                            bg_penalty_value,
                             time_left,
                         )
                     )
@@ -704,8 +678,6 @@ def train_controlnet(
         # Calculate epoch average, accounting for skipped batches
         if valid_batches > 0:
             epoch_loss = epoch_loss_ / valid_batches
-            epoch_l1_loss = epoch_l1_loss_ / valid_batches
-            epoch_bg_loss = epoch_bg_loss_ / valid_batches
         else:
             # All batches were skipped (NaN), use previous loss or skip this epoch
             logger.warning(f"[Epoch {global_epoch}/{start_epoch + n_epochs - 1}] All batches skipped due to NaN loss!")
@@ -728,14 +700,10 @@ def train_controlnet(
 
             # Validation loop (if enabled)
             val_loss = None
-            val_l1_loss = None
-            val_bg_loss = None
             if validation_enabled and val_loader is not None and (global_epoch % validation_freq == 0):
                 logger.info(f"Running validation at epoch {global_epoch}...")
                 controlnet.eval()
                 val_loss_ = 0
-                val_l1_loss_ = 0
-                val_bg_loss_ = 0
                 val_valid_batches = 0
                 val_skipped_batches = 0
                 val_skip_reasons = {"missing_keys": 0, "nan_inputs": 0, "nan_loss": 0, "other": 0}
@@ -808,25 +776,17 @@ def train_controlnet(
                                 else:
                                     raise ValueError(f"Unknown prediction type: {noise_scheduler.prediction_type}")
 
-                                # Same loss computation as training, but separate components
+                                # Same weighted L1 loss computation as training
                                 val_roi_mask_latent = F.max_pool3d(val_labels.float(), kernel_size=4, stride=4) > 0.0
-                                val_weights = torch.ones_like(val_model_output)
-                                val_weights[val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)] = 3.0
-                                val_l1_loss_raw = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
-                                val_l1_loss = (val_l1_loss_raw * val_weights).mean()
+                                val_raw_l1_loss = F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none")
 
+                                val_weight_mask = torch.ones_like(val_raw_l1_loss)
                                 if val_roi_mask_latent.sum() > 0:
-                                    val_bg_mask_expanded = (~val_roi_mask_latent).repeat(1, val_model_output.shape[1], 1, 1, 1)
-                                else:
-                                    val_bg_mask_expanded = torch.ones_like(val_model_output, dtype=torch.bool)
-
-                                val_pred_bg = val_model_output.float()[val_bg_mask_expanded]
-                                val_gt_bg = val_model_gt.float()[val_bg_mask_expanded]
-                                val_false_positive_bg = F.relu(val_pred_bg - val_gt_bg)
-                                val_bg_penalty_loss = 5.0 * (val_false_positive_bg ** 2).mean()
+                                    val_roi_mask_expanded = val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)
+                                    val_weight_mask[val_roi_mask_expanded] = 5.0
 
                                 # Total validation loss
-                                val_loss = val_l1_loss + val_bg_penalty_loss
+                                val_loss = (val_raw_l1_loss * val_weight_mask).mean()
 
                             # Check for NaN or Inf loss
                             if not torch.isfinite(val_loss):
@@ -842,15 +802,13 @@ def train_controlnet(
                                 continue
 
                             val_loss_ += val_loss.detach()
-                            val_l1_loss_ += val_l1_loss.detach()
-                            val_bg_loss_ += val_bg_penalty_loss.detach()
                             val_valid_batches += 1
 
                             # Log progress every 10 batches
                             if (val_step + 1) % 10 == 0:
                                 logger.info(
                                     f"  [Val Batch {val_step + 1}/{len(val_loader)}] "
-                                    f"Total={val_loss:.4f}, L1={val_l1_loss:.4f}, BgPen={val_bg_penalty_loss:.4f}"
+                                    f"Loss={val_loss:.4f}"
                                 )
 
                         except Exception as e:
@@ -862,11 +820,9 @@ def train_controlnet(
                 # Validation summary
                 if val_valid_batches > 0:
                     val_loss = val_loss_ / val_valid_batches
-                    val_l1_loss = val_l1_loss_ / val_valid_batches
-                    val_bg_loss = val_bg_loss_ / val_valid_batches
                     logger.info(
                         f"[Epoch {global_epoch}] Validation COMPLETE: "
-                        f"Total={val_loss:.4f}, L1={val_l1_loss:.4f}, BgPen={val_bg_loss:.4f} "
+                        f"Loss={val_loss:.4f} "
                         f"({val_valid_batches} batches"
                     )
                     if val_skipped_batches > 0:
@@ -875,16 +831,12 @@ def train_controlnet(
                             f"reasons: {val_skip_reasons}"
                         )
                     tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", val_loss.cpu().item(), total_step)
-                    tensorboard_writer.add_scalar("val/val_l1_loss_epoch", val_l1_loss.cpu().item(), total_step)
-                    tensorboard_writer.add_scalar("val/val_bg_penalty_loss_epoch", val_bg_loss.cpu().item(), total_step)
                 else:
                     logger.warning(
                         f"[Epoch {global_epoch}] All validation batches skipped! "
                         f"Skip reasons: {val_skip_reasons}"
                     )
                     val_loss = None
-                    val_l1_loss = None
-                    val_bg_loss = None
 
                 controlnet.train()
 

@@ -7,7 +7,7 @@
         "n_epochs": 50,
         "unet_blocks_to_unfreeze": [],
         "unet_lr": null,
-        "validation_frequency": 2,
+        "validation_frequency": 1,
         "weighted_loss_label": [129],
         "weighted_loss": 100
     },
