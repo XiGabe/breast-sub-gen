@@ -22,8 +22,8 @@
     },
     "controlnet_infer": {
        "num_inference_steps": 30,
-       "autoencoder_sliding_window_infer_size": [80, 80, 32],
-       "autoencoder_sliding_window_infer_overlap": 0.4,
+       "autoencoder_sliding_window_infer_size": [160, 160, 64],
+       "autoencoder_sliding_window_infer_overlap": 0.6,
        "modality": 9
     }
 }
