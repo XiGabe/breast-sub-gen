@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 """
-Analyze Stage 1 vs Stage 2 inference outputs with Ground Truth comparison.
+Analyze Stage 1 inference outputs with Ground Truth comparison.
 
-This script compares the outputs from Stage 1 and Stage 2 models against GT,
-focusing on:
+This script compares Stage 1 model outputs against GT, focusing on:
 1. Background suppression effectiveness
 2. Tumor enhancement intensity
 3. Spatial distribution patterns
-4. Statistical differences between stages
+4. Statistical analysis
 5. MAE metrics against ground truth
 """
 
@@ -22,12 +21,11 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 # Define paths
-STAGE1_DIR = "./outputs/inference_stage1_final/nifti_outputs"
-STAGE2_DIR = "./outputs/inference_stage2_final/nifti_outputs"
-GT_DIR = "./data/step_4"
+STAGE1_DIR = "./outputs/inference_stage1_vis_compare/nifti_outputs"
+GT_DIR = "./data/step_4"  # Ground truth subtraction images
 PROCESSED_PRE_DIR = "./data/processed_pre"
-OUTPUT_DIR = "./outputs/analysis_report"
-SAMPLES = ["DUKE_021_L", "DUKE_022_L", "DUKE_041_L"]
+OUTPUT_DIR = "./outputs/analysis_stage1_vs_gt"
+SAMPLES = ["DUKE_021_L", "DUKE_021_R", "DUKE_022_L"]
 TARGET_SIZE = (256, 256, 256)
 
 
@@ -224,6 +222,31 @@ def compute_mae(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray,
     }
 
 
+def load_gt_subtraction_v2(sample_id: str) -> Optional[np.ndarray]:
+    """Load ground truth subtraction from step_4 directory.
+
+    Args:
+        sample_id: Sample identifier (e.g., "DUKE_021_L")
+
+    Returns:
+        Ground truth subtraction array or None
+    """
+    gt_path = os.path.join(GT_DIR, f"{sample_id}_sub.nii.gz")
+    if not os.path.exists(gt_path):
+        print(f"Warning: GT subtraction not found: {gt_path}")
+        return None
+
+    gt_nii = nib.load(gt_path)
+    gt_data = gt_nii.get_fdata().astype(np.float32)
+
+    # Ensure target size
+    if gt_data.shape != TARGET_SIZE:
+        print(f"Warning: GT shape {gt_data.shape} != target {TARGET_SIZE}, resizing...")
+        gt_data = resize_to_target(gt_data, TARGET_SIZE)
+
+    return gt_data
+
+
 def analyze_sample(sample_id: str) -> Tuple:
     """Analyze a single sample with ground truth.
 
@@ -231,7 +254,7 @@ def analyze_sample(sample_id: str) -> Tuple:
         sample_id: Sample identifier (e.g., "DUKE_021_L")
 
     Returns:
-        (results_dict, gt_sub, stage1_sub, stage2_sub, pre, mask)
+        (results_dict, gt_sub, stage1_sub, pre, mask)
     """
     results = {"sample_id": sample_id}
 
@@ -240,15 +263,12 @@ def analyze_sample(sample_id: str) -> Tuple:
     stage1_pre = load_nifti(os.path.join(STAGE1_DIR, f"{sample_id}_pre.nii.gz"))
     stage1_mask = load_nifti(os.path.join(STAGE1_DIR, f"{sample_id}_mask.nii.gz"))
 
-    # Load Stage 2
-    stage2_sub = load_nifti(os.path.join(STAGE2_DIR, f"{sample_id}_generated_sub.nii.gz"))
+    # Load Ground Truth
+    gt_sub = load_gt_subtraction_v2(sample_id)
 
-    # Load Ground Truth from step_4
-    gt_sub = load_gt_subtraction(sample_id)
-
-    if stage1_sub is None or stage2_sub is None or gt_sub is None:
+    if stage1_sub is None or gt_sub is None:
         print(f"Warning: Could not load data for {sample_id}")
-        return results, None, None, None, None, None
+        return results, None, None, None, None
 
     # Use Stage 1 pre and mask for consistency
     pre = stage1_pre
@@ -285,40 +305,22 @@ def analyze_sample(sample_id: str) -> Tuple:
     for key, value in stage1_stats.items():
         results[f"stage1_{key}"] = value
 
-    # Analyze Stage 2
-    stage2_stats = {}
-    stage2_stats.update(compute_statistics(stage2_sub, tumor_mask, "tumor"))
-    stage2_stats.update(compute_statistics(stage2_sub, breast_mask, "breast"))
-    stage2_stats.update(compute_statistics(stage2_sub, bg_mask, "background"))
-    stage2_stats.update(compute_statistics(stage2_sub, tumor_mask | breast_mask, "foreground"))
-    stage2_stats.update(compute_background_suppression_metrics(stage2_sub, bg_mask))
-    # MAE against GT
-    stage2_stats.update(compute_mae(stage2_sub, gt_sub, tumor_mask, "tumor"))
-    stage2_stats.update(compute_mae(stage2_sub, gt_sub, breast_mask, "breast"))
-    stage2_stats.update(compute_mae(stage2_sub, gt_sub, bg_mask, "background"))
-    stage2_stats.update(compute_mae(stage2_sub, gt_sub, tumor_mask | breast_mask, "foreground"))
-    stage2_stats.update(compute_mae(stage2_sub, gt_sub, np.ones_like(gt_sub, dtype=bool), "global"))
-
-    for key, value in stage2_stats.items():
-        results[f"stage2_{key}"] = value
-
-    return results, gt_sub, stage1_sub, stage2_sub, pre, mask
+    return results, gt_sub, stage1_sub, pre, mask
 
 
 def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
-                                   stage1_sub: np.ndarray, stage2_sub: np.ndarray,
+                                   stage1_sub: np.ndarray,
                                    pre: np.ndarray, mask: np.ndarray):
     """Generate histogram comparison plot with GT."""
     tumor_mask, breast_mask, bg_mask = create_masks(pre, mask)
 
-    fig = plt.figure(figsize=(20, 12))
+    fig = plt.figure(figsize=(18, 12))
     gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
 
     # Global histograms (top row)
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.hist(gt_sub.flatten(), bins=100, alpha=0.5, label='GT', color='green', density=True)
+    ax1.hist(gt_sub.flatten(), bins=100, alpha=0.5, label='Ground Truth', color='green', density=True)
     ax1.hist(stage1_sub.flatten(), bins=100, alpha=0.5, label='Stage 1', color='blue', density=True)
-    ax1.hist(stage2_sub.flatten(), bins=100, alpha=0.5, label='Stage 2', color='red', density=True)
     ax1.set_xlabel('Intensity')
     ax1.set_ylabel('Density')
     ax1.set_title('Global Intensity Distribution')
@@ -328,9 +330,8 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
     # Tumor region histograms (middle row)
     ax2 = fig.add_subplot(gs[1, 0])
     if tumor_mask.sum() > 0:
-        ax2.hist(gt_sub[tumor_mask], bins=50, alpha=0.5, label='GT', color='green', density=True)
+        ax2.hist(gt_sub[tumor_mask], bins=50, alpha=0.5, label='Ground Truth', color='green', density=True)
         ax2.hist(stage1_sub[tumor_mask], bins=50, alpha=0.5, label='Stage 1', color='blue', density=True)
-        ax2.hist(stage2_sub[tumor_mask], bins=50, alpha=0.5, label='Stage 2', color='red', density=True)
     ax2.set_xlabel('Intensity')
     ax2.set_ylabel('Density')
     ax2.set_title('Tumor Region Intensity Distribution')
@@ -339,9 +340,8 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
 
     # Background region histograms (bottom row)
     ax3 = fig.add_subplot(gs[2, 0])
-    ax3.hist(gt_sub[bg_mask], bins=100, alpha=0.5, label='GT', color='green', density=True)
+    ax3.hist(gt_sub[bg_mask], bins=100, alpha=0.5, label='Ground Truth', color='green', density=True)
     ax3.hist(stage1_sub[bg_mask], bins=100, alpha=0.5, label='Stage 1', color='blue', density=True)
-    ax3.hist(stage2_sub[bg_mask], bins=100, alpha=0.5, label='Stage 2', color='red', density=True)
     ax3.set_xlabel('Intensity')
     ax3.set_ylabel('Density')
     ax3.set_title('Background Region Intensity Distribution')
@@ -350,9 +350,8 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
 
     # CDF plots (right column)
     ax4 = fig.add_subplot(gs[0, 1])
-    for data, label, color in [(gt_sub, 'GT', 'green'),
-                                (stage1_sub, 'Stage 1', 'blue'),
-                                (stage2_sub, 'Stage 2', 'red')]:
+    for data, label, color in [(gt_sub, 'Ground Truth', 'green'),
+                                (stage1_sub, 'Stage 1', 'blue')]:
         sorted_vals = np.sort(data.flatten())
         cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
         ax4.plot(sorted_vals, cdf, label=label, color=color, linewidth=2)
@@ -366,9 +365,8 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
     # Tumor CDF
     ax5 = fig.add_subplot(gs[1, 1])
     if tumor_mask.sum() > 0:
-        for data, label, color in [(gt_sub, 'GT', 'green'),
-                                    (stage1_sub, 'Stage 1', 'blue'),
-                                    (stage2_sub, 'Stage 2', 'red')]:
+        for data, label, color in [(gt_sub, 'Ground Truth', 'green'),
+                                    (stage1_sub, 'Stage 1', 'blue')]:
             sorted_vals = np.sort(data[tumor_mask])
             cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
             ax5.plot(sorted_vals, cdf, label=label, color=color, linewidth=2)
@@ -381,9 +379,8 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
 
     # Background CDF (zoomed)
     ax6 = fig.add_subplot(gs[2, 1])
-    for data, label, color in [(gt_sub, 'GT', 'green'),
-                                (stage1_sub, 'Stage 1', 'blue'),
-                                (stage2_sub, 'Stage 2', 'red')]:
+    for data, label, color in [(gt_sub, 'Ground Truth', 'green'),
+                                (stage1_sub, 'Stage 1', 'blue')]:
         sorted_vals = np.sort(data[bg_mask])
         cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
         ax6.plot(sorted_vals, cdf, label=label, color=color, linewidth=2)
@@ -409,18 +406,11 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
         (stage1_sub[bg_mask] < 0.10).sum() / bg_mask.sum() * 100,
         (stage1_sub[bg_mask] < 0.20).sum() / bg_mask.sum() * 100,
     ]
-    s2_metrics = [
-        (stage2_sub[bg_mask] < 0.01).sum() / bg_mask.sum() * 100,
-        (stage2_sub[bg_mask] < 0.05).sum() / bg_mask.sum() * 100,
-        (stage2_sub[bg_mask] < 0.10).sum() / bg_mask.sum() * 100,
-        (stage2_sub[bg_mask] < 0.20).sum() / bg_mask.sum() * 100,
-    ]
 
     x = np.arange(len(metrics))
-    width = 0.25
-    ax7.bar(x - width, gt_metrics, width, label='GT', color='green')
-    ax7.bar(x, s1_metrics, width, label='Stage 1', color='blue')
-    ax7.bar(x + width, s2_metrics, width, label='Stage 2', color='red')
+    width = 0.35
+    ax7.bar(x - width/2, gt_metrics, width, label='Ground Truth', color='green')
+    ax7.bar(x + width/2, s1_metrics, width, label='Stage 1', color='blue')
     ax7.set_ylabel('Percentage (%)')
     ax7.set_title('Background Suppression Quality\n(Higher is better)')
     ax7.set_xticks(x)
@@ -439,37 +429,28 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
         np.abs(stage1_sub[tumor_mask] - gt_sub[tumor_mask]).mean() if tumor_mask.sum() > 0 else 0,
         np.abs(stage1_sub[tumor_mask | breast_mask] - gt_sub[tumor_mask | breast_mask]).mean(),
     ]
-    s2_mae = [
-        np.abs(stage2_sub - gt_sub).mean(),
-        np.abs(stage2_sub[bg_mask] - gt_sub[bg_mask]).mean(),
-        np.abs(stage2_sub[breast_mask] - gt_sub[breast_mask]).mean() if breast_mask.sum() > 0 else 0,
-        np.abs(stage2_sub[tumor_mask] - gt_sub[tumor_mask]).mean() if tumor_mask.sum() > 0 else 0,
-        np.abs(stage2_sub[tumor_mask | breast_mask] - gt_sub[tumor_mask | breast_mask]).mean(),
-    ]
 
     x = np.arange(len(regions))
-    width = 0.35
-    ax8.bar(x - width/2, s1_mae, width, label='Stage 1', color='blue')
-    ax8.bar(x + width/2, s2_mae, width, label='Stage 2', color='red')
+    ax8.bar(x, s1_mae, label='Stage 1 MAE', color='blue')
     ax8.set_ylabel('MAE')
     ax8.set_title('Mean Absolute Error by Region\n(Lower is better)')
     ax8.set_xticks(x)
     ax8.set_xticklabels(regions, rotation=45, ha='right')
-    ax8.legend()
     ax8.grid(axis='y', alpha=0.3)
+    # Add value labels on bars
+    for i, v in enumerate(s1_mae):
+        ax8.text(i, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
 
     # Percentile comparison (bottom right)
     ax9 = fig.add_subplot(gs[2, 2])
     percentiles = [5, 25, 50, 75, 95]
     gt_p = np.percentile(gt_sub[tumor_mask], percentiles) if tumor_mask.sum() > 0 else [0, 0, 0, 0, 0]
     s1_p = np.percentile(stage1_sub[tumor_mask], percentiles) if tumor_mask.sum() > 0 else [0, 0, 0, 0, 0]
-    s2_p = np.percentile(stage2_sub[tumor_mask], percentiles) if tumor_mask.sum() > 0 else [0, 0, 0, 0, 0]
 
     x = np.arange(len(percentiles))
-    width = 0.25
-    ax9.bar(x - width, gt_p, width, label='GT', color='green')
-    ax9.bar(x, s1_p, width, label='Stage 1', color='blue')
-    ax9.bar(x + width, s2_p, width, label='Stage 2', color='red')
+    width = 0.35
+    ax9.bar(x - width/2, gt_p, width, label='Ground Truth', color='green')
+    ax9.bar(x + width/2, s1_p, width, label='Stage 1', color='blue')
     ax9.set_ylabel('Intensity')
     ax9.set_title('Tumor Region Percentiles')
     ax9.set_xticks(x)
@@ -477,7 +458,7 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
     ax9.legend()
     ax9.grid(axis='y', alpha=0.3)
 
-    plt.suptitle(f'Sample: {sample_id} - Intensity Distribution Analysis', fontsize=16, y=1.02)
+    plt.suptitle(f'Sample: {sample_id} - Stage 1 vs Ground Truth Analysis', fontsize=16, y=1.02)
 
     output_path = os.path.join(OUTPUT_DIR, f"{sample_id}_distributions.png")
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -486,9 +467,9 @@ def generate_histogram_comparison(sample_id: str, gt_sub: np.ndarray,
 
 
 def generate_slice_comparison(sample_id: str, gt_sub: np.ndarray,
-                               stage1_sub: np.ndarray, stage2_sub: np.ndarray,
+                               stage1_sub: np.ndarray,
                                pre: np.ndarray, mask: np.ndarray):
-    """Generate slice comparison with GT (4 columns)."""
+    """Generate slice comparison with GT (3 columns: Pre, GT, Stage 1)."""
     tumor_mask, breast_mask, bg_mask = create_masks(pre, mask)
 
     # Find center slices
@@ -497,7 +478,7 @@ def generate_slice_comparison(sample_id: str, gt_sub: np.ndarray,
     coronal_slice = w // 2
     sagittal_slice = h // 2
 
-    fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
 
     # Row 1: Axial view
     # Pre-contrast
@@ -522,14 +503,6 @@ def generate_slice_comparison(sample_id: str, gt_sub: np.ndarray,
     axes[0, 2].axis('off')
     plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
 
-    # Stage 2
-    im = axes[0, 3].imshow(stage2_sub[:, :, axial_slice].T, cmap='hot', vmin=0, vmax=1, origin='lower')
-    axes[0, 3].contour(pre[:, :, axial_slice].T, levels=[0.05], colors='cyan', linewidths=0.5, alpha=0.5, origin='lower')
-    axes[0, 3].contour(mask[:, :, axial_slice].T, levels=[0.5], colors='lime', linewidths=1, origin='lower')
-    axes[0, 3].set_title('Stage 2 (Axial)')
-    axes[0, 3].axis('off')
-    plt.colorbar(im, ax=axes[0, 3], fraction=0.046)
-
     # Row 2: Coronal view
     im = axes[1, 0].imshow(pre[:, coronal_slice, :].T, cmap='gray', origin='lower')
     axes[1, 0].set_title('Pre-contrast (Coronal)')
@@ -549,13 +522,6 @@ def generate_slice_comparison(sample_id: str, gt_sub: np.ndarray,
     axes[1, 2].set_title('Stage 1 (Coronal)')
     axes[1, 2].axis('off')
     plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
-
-    im = axes[1, 3].imshow(stage2_sub[:, coronal_slice, :].T, cmap='hot', vmin=0, vmax=1, origin='lower')
-    axes[1, 3].contour(pre[:, coronal_slice, :].T, levels=[0.05], colors='cyan', linewidths=0.5, alpha=0.5, origin='lower')
-    axes[1, 3].contour(mask[:, coronal_slice, :].T, levels=[0.5], colors='lime', linewidths=1, origin='lower')
-    axes[1, 3].set_title('Stage 2 (Coronal)')
-    axes[1, 3].axis('off')
-    plt.colorbar(im, ax=axes[1, 3], fraction=0.046)
 
     # Row 3: Sagittal view
     im = axes[2, 0].imshow(pre[sagittal_slice, :, :].T, cmap='gray', origin='lower')
@@ -577,14 +543,7 @@ def generate_slice_comparison(sample_id: str, gt_sub: np.ndarray,
     axes[2, 2].axis('off')
     plt.colorbar(im, ax=axes[2, 2], fraction=0.046)
 
-    im = axes[2, 3].imshow(stage2_sub[sagittal_slice, :, :].T, cmap='hot', vmin=0, vmax=1, origin='lower')
-    axes[2, 3].contour(pre[sagittal_slice, :, :].T, levels=[0.05], colors='cyan', linewidths=0.5, alpha=0.5, origin='lower')
-    axes[2, 3].contour(mask[sagittal_slice, :, :].T, levels=[0.5], colors='lime', linewidths=1, origin='lower')
-    axes[2, 3].set_title('Stage 2 (Sagittal)')
-    axes[2, 3].axis('off')
-    plt.colorbar(im, ax=axes[2, 3], fraction=0.046)
-
-    plt.suptitle(f'Sample: {sample_id} - Slice Comparison', fontsize=16, y=1.02)
+    plt.suptitle(f'Sample: {sample_id} - Stage 1 vs Ground Truth Slice Comparison', fontsize=16, y=1.02)
 
     output_path = os.path.join(OUTPUT_DIR, f"{sample_id}_slices.png")
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -596,7 +555,7 @@ def generate_summary_report(all_results: list):
     """Generate a comprehensive summary report."""
     report = []
     report.append("=" * 80)
-    report.append("STAGE 1 VS STAGE 2 VS GROUND TRUTH ANALYSIS REPORT")
+    report.append("STAGE 1 VS GROUND TRUTH ANALYSIS REPORT")
     report.append("=" * 80)
     report.append("")
 
@@ -612,46 +571,25 @@ def generate_summary_report(all_results: list):
     def format_val(val):
         return f"{val:.4f}" if not np.isnan(val) else "N/A"
 
-    # Global MAE comparison
+    # Global MAE
     report.append("### GLOBAL MAE (Lower is better)")
     report.append("-" * 40)
     s1_global_mae = avg_metric("stage1_global_mae")
-    s2_global_mae = avg_metric("stage2_global_mae")
     report.append(f"  Stage 1: {format_val(s1_global_mae)}")
-    report.append(f"  Stage 2: {format_val(s2_global_mae)}")
-    if not np.isnan(s1_global_mae) and not np.isnan(s2_global_mae):
-        if s2_global_mae < s1_global_mae:
-            report.append(f"  Winner: Stage 2 ({abs(s2_global_mae/s1_global_mae - 1)*100:.1f}% better)")
-        else:
-            report.append(f"  Winner: Stage 1 ({abs(s1_global_mae/s2_global_mae - 1)*100:.1f}% better)")
     report.append("")
 
     # Background suppression MAE
     report.append("### BACKGROUND MAE (Lower is better)")
     report.append("-" * 40)
     s1_bg_mae = avg_metric("stage1_background_mae")
-    s2_bg_mae = avg_metric("stage2_background_mae")
     report.append(f"  Stage 1: {format_val(s1_bg_mae)}")
-    report.append(f"  Stage 2: {format_val(s2_bg_mae)}")
-    if not np.isnan(s1_bg_mae) and not np.isnan(s2_bg_mae):
-        if s2_bg_mae < s1_bg_mae:
-            report.append(f"  Winner: Stage 2 ({abs(s2_bg_mae/s1_bg_mae - 1)*100:.1f}% better)")
-        else:
-            report.append(f"  Winner: Stage 1 ({abs(s1_bg_mae/s2_bg_mae - 1)*100:.1f}% better)")
     report.append("")
 
     # Tumor enhancement MAE
     report.append("### TUMOR MAE (Lower is better)")
     report.append("-" * 40)
     s1_tumor_mae = avg_metric("stage1_tumor_mae")
-    s2_tumor_mae = avg_metric("stage2_tumor_mae")
     report.append(f"  Stage 1: {format_val(s1_tumor_mae)}")
-    report.append(f"  Stage 2: {format_val(s2_tumor_mae)}")
-    if not np.isnan(s1_tumor_mae) and not np.isnan(s2_tumor_mae):
-        if s2_tumor_mae < s1_tumor_mae:
-            report.append(f"  Winner: Stage 2 ({abs(s2_tumor_mae/s1_tumor_mae - 1)*100:.1f}% better)")
-        else:
-            report.append(f"  Winner: Stage 1 ({abs(s1_tumor_mae/s2_tumor_mae - 1)*100:.1f}% better)")
     report.append("")
 
     # Background suppression quality
@@ -661,11 +599,9 @@ def generate_summary_report(all_results: list):
         key = f"bg_pct_below_{int(thresh*100):03d}"
         gt_pct = avg_metric(f"gt_{key}")
         s1_pct = avg_metric(f"stage1_{key}")
-        s2_pct = avg_metric(f"stage2_{key}")
         report.append(f"  Below {thresh}:")
         report.append(f"    GT:       {format_val(gt_pct)}%")
         report.append(f"    Stage 1:  {format_val(s1_pct)}%")
-        report.append(f"    Stage 2:  {format_val(s2_pct)}%")
     report.append("")
 
     # Tumor intensity statistics
@@ -674,11 +610,9 @@ def generate_summary_report(all_results: list):
     for stat in ["mean", "std", "median", "p95"]:
         gt_val = avg_metric(f"gt_tumor_{stat}")
         s1_val = avg_metric(f"stage1_tumor_{stat}")
-        s2_val = avg_metric(f"stage2_tumor_{stat}")
         report.append(f"  {stat.upper()}:")
         report.append(f"    GT:       {format_val(gt_val)}")
         report.append(f"    Stage 1:  {format_val(s1_val)}")
-        report.append(f"    Stage 2:  {format_val(s2_val)}")
     report.append("")
 
     # Per-sample details
@@ -692,44 +626,35 @@ def generate_summary_report(all_results: list):
         report.append(f"## {sample_id}")
         report.append("")
 
-        report.append("### MAE Comparison")
-        report.append(f"  {'Region':<15} {'Stage 1':<12} {'Stage 2':<12} {'Better':<10}")
-        report.append("  " + "-" * 50)
+        report.append("### MAE by Region")
+        report.append(f"  {'Region':<15} {'MAE':<12}")
+        report.append("  " + "-" * 30)
 
         for region, region_key in [("Global", "global"), ("Background", "background"),
                                     ("Breast", "breast"), ("Tumor", "tumor"), ("Foreground", "foreground")]:
             s1_mae = result.get(f"stage1_{region_key}_mae", np.nan)
-            s2_mae = result.get(f"stage2_{region_key}_mae", np.nan)
-
-            if not np.isnan(s1_mae) and not np.isnan(s2_mae):
-                better = "S1" if s1_mae < s2_mae else "S2"
-                diff = abs(s1_mae - s2_mae) / max(s1_mae, s2_mae) * 100
-                report.append(f"  {region:<15} {s1_mae:<12.4f} {s2_mae:<12.4f} {better} ({diff:.1f}%)")
-            else:
-                report.append(f"  {region:<15} {format_val(s1_mae):<12} {format_val(s2_mae):<12} N/A")
+            report.append(f"  {region:<15} {format_val(s1_mae):<12}")
 
         report.append("")
         report.append("### Background Suppression (% voxels below threshold)")
-        report.append(f"  {'Threshold':<12} {'GT':<10} {'Stage 1':<10} {'Stage 2':<10}")
-        report.append("  " + "-" * 45)
+        report.append(f"  {'Threshold':<12} {'GT':<10} {'Stage 1':<10}")
+        report.append("  " + "-" * 35)
 
         for thresh in [0.01, 0.05, 0.10, 0.20]:
             key = f"bg_pct_below_{int(thresh*100):03d}"
             gt_pct = result.get(f"gt_{key}", np.nan)
             s1_pct = result.get(f"stage1_{key}", np.nan)
-            s2_pct = result.get(f"stage2_{key}", np.nan)
-            report.append(f"  {thresh:<12.2f} {format_val(gt_pct):<10} {format_val(s1_pct):<10} {format_val(s2_pct):<10}")
+            report.append(f"  {thresh:<12.2f} {format_val(gt_pct):<10} {format_val(s1_pct):<10}")
 
         report.append("")
         report.append("### Tumor Region Statistics")
-        report.append(f"  {'Metric':<10} {'GT':<10} {'Stage 1':<10} {'Stage 2':<10}")
-        report.append("  " + "-" * 45)
+        report.append(f"  {'Metric':<10} {'GT':<10} {'Stage 1':<10}")
+        report.append("  " + "-" * 35)
 
         for stat in ["mean", "std", "median", "p95"]:
             gt_val = result.get(f"gt_tumor_{stat}", np.nan)
             s1_val = result.get(f"stage1_tumor_{stat}", np.nan)
-            s2_val = result.get(f"stage2_tumor_{stat}", np.nan)
-            report.append(f"  {stat:<10} {format_val(gt_val):<10} {format_val(s1_val):<10} {format_val(s2_val):<10}")
+            report.append(f"  {stat:<10} {format_val(gt_val):<10} {format_val(s1_val):<10}")
 
         report.append("")
         report.append("-" * 80)
@@ -743,41 +668,32 @@ def generate_summary_report(all_results: list):
 
     findings = []
 
-    # Check regression
-    if not np.isnan(s2_global_mae) and not np.isnan(s1_global_mae):
-        if s2_global_mae > s1_global_mae * 1.1:
-            findings.append(f"⚠️  STAGE 2 REGRESSION: Stage 2 has {abs(s2_global_mae/s1_global_mae - 1)*100:.1f}% HIGHER global MAE than Stage 1")
-        elif s2_global_mae < s1_global_mae * 0.9:
-            findings.append(f"✓ STAGE 2 IMPROVEMENT: Stage 2 has {abs(s1_global_mae/s2_global_mae - 1)*100:.1f}% LOWER global MAE than Stage 1")
-
     # Background suppression check
     gt_bg_suppress = avg_metric("gt_bg_pct_below_010")
     s1_bg_suppress = avg_metric("stage1_bg_pct_below_010")
-    s2_bg_suppress = avg_metric("stage2_bg_pct_below_010")
 
     if gt_bg_suppress > 50:
         if s1_bg_suppress < 20:
-            findings.append(f"⚠️  POOR BACKGROUND SUPPRESSION (Stage 1): Only {s1_bg_suppress:.1f}% of background < 0.10 (GT: {gt_bg_suppress:.1f}%)")
-        if s2_bg_suppress < 20:
-            findings.append(f"⚠️  POOR BACKGROUND SUPPRESSION (Stage 2): Only {s2_bg_suppress:.1f}% of background < 0.10 (GT: {gt_bg_suppress:.1f}%)")
+            findings.append(f"⚠️  POOR BACKGROUND SUPPRESSION: Only {s1_bg_suppress:.1f}% of background < 0.10 (GT: {gt_bg_suppress:.1f}%)")
+        elif s1_bg_suppress < gt_bg_suppress * 0.5:
+            findings.append(f"⚠️  WEAK BACKGROUND SUPPRESSION: {s1_bg_suppress:.1f}% of background < 0.10 (GT: {gt_bg_suppress:.1f}%)")
 
     # Tumor enhancement check
     gt_tumor_mean = avg_metric("gt_tumor_mean")
     s1_tumor_mean = avg_metric("stage1_tumor_mean")
-    s2_tumor_mean = avg_metric("stage2_tumor_mean")
 
     if not np.isnan(gt_tumor_mean):
         if abs(s1_tumor_mean - gt_tumor_mean) / gt_tumor_mean > 0.3:
-            findings.append(f"⚠️  STAGE 1 TUMOR INTENSITY BIAS: {s1_tumor_mean:.3f} vs GT {gt_tumor_mean:.3f} ({abs(s1_tumor_mean/gt_tumor_mean - 1)*100:.1f}% error)")
-        if abs(s2_tumor_mean - gt_tumor_mean) / gt_tumor_mean > 0.3:
-            findings.append(f"⚠️  STAGE 2 TUMOR INTENSITY BIAS: {s2_tumor_mean:.3f} vs GT {gt_tumor_mean:.3f} ({abs(s2_tumor_mean/gt_tumor_mean - 1)*100:.1f}% error)")
+            findings.append(f"⚠️  TUMOR INTENSITY BIAS: {s1_tumor_mean:.3f} vs GT {gt_tumor_mean:.3f} ({abs(s1_tumor_mean/gt_tumor_mean - 1)*100:.1f}% error)")
+        elif abs(s1_tumor_mean - gt_tumor_mean) / gt_tumor_mean > 0.1:
+            findings.append(f"⚠️  TUMOR INTENSITY DIFFERENCE: {s1_tumor_mean:.3f} vs GT {gt_tumor_mean:.3f} ({abs(s1_tumor_mean/gt_tumor_mean - 1)*100:.1f}% error)")
 
     for finding in findings:
         report.append(finding)
     report.append("")
 
     if not findings:
-        report.append("No significant issues detected. Both stages perform similarly.")
+        report.append("✓ No major issues detected. Stage 1 performs reasonably well.")
 
     report.append("")
     report.append("=" * 80)
@@ -799,7 +715,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("=" * 80)
-    print("STAGE 1 VS STAGE 2 VS GROUND TRUTH ANALYSIS")
+    print("STAGE 1 VS GROUND TRUTH ANALYSIS")
     print("=" * 80)
     print("")
 
@@ -810,7 +726,7 @@ def main():
         print(f"Analyzing: {sample_id}")
         print('=' * 80)
 
-        results, gt_sub, stage1_sub, stage2_sub, pre, mask = analyze_sample(sample_id)
+        results, gt_sub, stage1_sub, pre, mask = analyze_sample(sample_id)
 
         if gt_sub is None:
             print(f"Skipping {sample_id} due to missing data")
@@ -819,19 +735,17 @@ def main():
         all_results.append(results)
 
         # Generate visualizations
-        generate_histogram_comparison(sample_id, gt_sub, stage1_sub, stage2_sub, pre, mask)
-        generate_slice_comparison(sample_id, gt_sub, stage1_sub, stage2_sub, pre, mask)
+        generate_histogram_comparison(sample_id, gt_sub, stage1_sub, pre, mask)
+        generate_slice_comparison(sample_id, gt_sub, stage1_sub, pre, mask)
 
         # Print key stats
         print(f"\nKey Statistics for {sample_id}:")
         print(f"  GT Tumor Mean: {results.get('gt_tumor_mean', np.nan):.4f}")
         print(f"  Stage 1 Tumor Mean: {results.get('stage1_tumor_mean', np.nan):.4f}")
-        print(f"  Stage 2 Tumor Mean: {results.get('stage2_tumor_mean', np.nan):.4f}")
         print(f"  GT Background < 0.10: {results.get('gt_bg_pct_below_010', np.nan):.2f}%")
         print(f"  Stage 1 Background < 0.10: {results.get('stage1_bg_pct_below_010', np.nan):.2f}%")
-        print(f"  Stage 2 Background < 0.10: {results.get('stage2_bg_pct_below_010', np.nan):.2f}%")
         print(f"  Stage 1 Global MAE: {results.get('stage1_global_mae', np.nan):.4f}")
-        print(f"  Stage 2 Global MAE: {results.get('stage2_global_mae', np.nan):.4f}")
+        print(f"  Stage 1 Tumor MAE: {results.get('stage1_tumor_mae', np.nan):.4f}")
 
     # Save statistics to CSV
     if all_results:

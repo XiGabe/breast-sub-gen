@@ -446,6 +446,11 @@ def train_controlnet(
     # Validation settings
     validation_enabled = val_loader is not None
     validation_freq = args.controlnet_train.get("validation_frequency", 1)  # Validate every N epochs
+
+    # ROI weight for tumor region in loss calculation
+    roi_weight = args.controlnet_train.get("weighted_loss", 100.0)
+    logger.info(f"ROI weight for tumor region: {roi_weight}")
+
     if validation_enabled:
         logger.info(f"Validation enabled: every {validation_freq} epoch(s)")
         logger.info(f"Validation dataloader created with {len(val_loader)} batches")
@@ -598,11 +603,11 @@ def train_controlnet(
 
                 # 3. Apply ROI weighting
                 # - Background: weight = 1.0 (standard diffusion loss - preserves vessels!)
-                # - Tumor ROI: weight = 5.0 (high priority on tumor accuracy)
+                # - Tumor ROI: weight = {roi_weight} (high priority on tumor accuracy)
                 weight_mask = torch.ones_like(raw_l1_loss)
                 if roi_mask_latent.sum() > 0:
                     roi_mask_expanded = roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)
-                    weight_mask[roi_mask_expanded] = 5.0
+                    weight_mask[roi_mask_expanded] = roi_weight
 
                 # 4. Final weighted loss
                 loss = (raw_l1_loss * weight_mask).mean()
@@ -783,7 +788,7 @@ def train_controlnet(
                                 val_weight_mask = torch.ones_like(val_raw_l1_loss)
                                 if val_roi_mask_latent.sum() > 0:
                                     val_roi_mask_expanded = val_roi_mask_latent.repeat(1, val_model_output.shape[1], 1, 1, 1)
-                                    val_weight_mask[val_roi_mask_expanded] = 5.0
+                                    val_weight_mask[val_roi_mask_expanded] = roi_weight
 
                                 # Total validation loss
                                 val_loss = (val_raw_l1_loss * val_weight_mask).mean()
@@ -849,9 +854,8 @@ def train_controlnet(
             if any(p.requires_grad for p in unet_to_check.parameters()):
                 unet_state_dict = unet.module.state_dict() if world_size > 1 else unet.state_dict()
 
-            # Save per-epoch checkpoint (use local epoch+1 for filename, global_epoch for saved field)
-            local_epoch = epoch + 1
-            epoch_checkpoint_path = f"{args.model_dir}/{args.exp_name}_epoch_{local_epoch}.pt"
+            # Save per-epoch checkpoint (use global epoch for filename)
+            epoch_checkpoint_path = f"{args.model_dir}/{args.exp_name}_epoch_{global_epoch}.pt"
             torch.save(
                 {
                     "epoch": global_epoch,  # Save global epoch number

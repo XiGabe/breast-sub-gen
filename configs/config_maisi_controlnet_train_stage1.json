@@ -4,7 +4,7 @@
         "cache_rate": 0.0,
         "fold": 0,
         "lr": 1e-4,
-        "n_epochs": 50,
+        "n_epochs": 34,
         "unet_blocks_to_unfreeze": [],
         "unet_lr": null,
         "validation_frequency": 1,

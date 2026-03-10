@@ -82,7 +82,7 @@ def load_ground_truth_latents(sample_id, data_base_dir):
     return gt_latent
 
 
-def decode_with_vae(vae, latents, scale_factor, device, infer_size=[80, 80, 32], overlap=0.4):
+def decode_with_vae(vae, latents, scale_factor, device, infer_size=[160, 160, 64], overlap=0.6):
     """
     Decode latent representations using VAE with sliding window inference.
 
