@@ -5,6 +5,7 @@
     "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
     "trained_diffusion_path": "./weights/diff_unet_3d_rflow-mr.pt",
     "existing_ckpt_filepath": "./models/breast_controlnet_stage1_best.pt",
+    "trained_controlnet_path": "./models/breast_controlnet_stage2_best.pt",
     "exp_name": "breast_controlnet_stage2",
     "start_epoch": 51,
     "data_base_dir": ["./data/"],

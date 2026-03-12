@@ -110,9 +110,9 @@ controlnet_cond = torch.cat([pre_images, masks], dim=1)
 roi_mask_latent = F.max_pool3d(labels, kernel_size=4, stride=4) > 0.0
 
 # MSE loss with ROI weighting
-raw_mse_loss = F.mse_loss(model_output, model_gt, reduction="none")
+raw_mse_loss = F.l1_loss(model_output, model_gt, reduction="none")
 weight_mask = torch.ones_like(raw_mse_loss)
-weight_mask[roi_mask_latent.repeat(1, 4, 1, 1, 1)] = 5.0
+weight_mask[roi_mask_latent.repeat(1, 4, 1, 1, 1)] = 100.0
 
 loss = (raw_mse_loss * weight_mask).mean()
 ```
