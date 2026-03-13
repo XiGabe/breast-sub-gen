@@ -172,7 +172,8 @@ def compute_model_output(
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
     return_controlnet_blocks=False,
-    use_checkpoint=False
+    use_checkpoint=False,
+    use_unconditional=False
 ):
     """
     Run ControlNet + U-Net to obtain the denoising network output (and optionally
@@ -217,6 +218,10 @@ def compute_model_output(
         return_controlnet_blocks (bool, optional):
             If True, also return `(down_block_res_samples, mid_block_res_sample)`.
             Defaults to False.
+        use_unconditional (bool, optional):
+            If True, run U-Net in unconditional mode (no ControlNet).
+            Used for Stage 3: U-Net domain pre-training.
+            Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, Optional[Any], Optional[Any]]:
@@ -252,20 +257,26 @@ def compute_model_output(
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
 
-    # get controlnet output
-    # Create a dictionary to store the inputs
-    controlnet_inputs = {
-        "x": noisy_latent,
-        "timesteps": timesteps,
-        "controlnet_cond": controlnet_cond,
-    }
-    if include_modality:
-        controlnet_inputs.update(
-            {
-                "class_labels": modality_tensor,
-            }
-        )
-    down_block_res_samples, mid_block_res_sample = controlnet(**controlnet_inputs)
+    # Stage 3: Unconditional generation - skip ControlNet, use U-Net directly
+    if use_unconditional:
+        # No ControlNet needed - unconditional generation
+        down_block_res_samples = None
+        mid_block_res_sample = None
+    else:
+        # get controlnet output
+        # Create a dictionary to store the inputs
+        controlnet_inputs = {
+            "x": noisy_latent,
+            "timesteps": timesteps,
+            "controlnet_cond": controlnet_cond,
+        }
+        if include_modality:
+            controlnet_inputs.update(
+                {
+                    "class_labels": modality_tensor,
+                }
+            )
+        down_block_res_samples, mid_block_res_sample = controlnet(**controlnet_inputs)
 
     # get diffusion network output
     # Create a dictionary to store the inputs
@@ -273,9 +284,12 @@ def compute_model_output(
         "x": noisy_latent,
         "timesteps": timesteps,
         "spacing_tensor": spacing_tensor,
-        "down_block_additional_residuals": down_block_res_samples,
-        "mid_block_additional_residual": mid_block_res_sample,
     }
+
+    # Add ControlNet residuals only if not using unconditional mode
+    if not use_unconditional:
+        unet_inputs["down_block_additional_residuals"] = down_block_res_samples
+        unet_inputs["mid_block_additional_residual"] = mid_block_res_sample
     # Add extra arguments if include_body_region is True
     if include_body_region:
         unet_inputs.update(
@@ -391,6 +405,22 @@ def train_controlnet(
     else:
         logger.info("train controlnet model from scratch.")
 
+    # Detect Stage 3: U-Net domain pre-training (unconditional generation)
+    stage = args.controlnet_train.get("stage", None)
+    is_stage3 = (stage == "stage3")
+
+    if is_stage3:
+        # Stage 3: U-Net domain pre-training - freeze ControlNet completely
+        logger.info("=" * 60)
+        logger.info("STAGE 3: U-Net Domain Pre-training (Unconditional Generation)")
+        logger.info("=" * 60)
+        # Freeze all ControlNet parameters
+        for p in controlnet.parameters():
+            p.requires_grad = False
+        logger.info("ControlNet: Fully frozen (not used in Stage 3)")
+        # U-Net will be unfrozen based on config below
+        logger.info("U-Net: Will be unfrozen based on config")
+
     # Freeze/unfreeze U-Net blocks based on config for progressive training
     unet_blocks_to_unfreeze = args.controlnet_train.get("unet_blocks_to_unfreeze", [])
     disable_inplace = args.controlnet_train.get("disable_inplace_for_checkpointing", False)
@@ -475,18 +505,28 @@ def train_controlnet(
 
     # Step 3: training config with dual learning rate support
     # Create optimizer with optional U-Net parameter group
-    params = [{"params": controlnet.parameters(), "lr": args.controlnet_train["lr"]}]
-
-    # Add U-Net parameters if any are unfrozen
-    unet_lr = args.controlnet_train.get("unet_lr", None)
     unet_to_check = unet.module if world_size > 1 else unet
-    if unet_lr and any(p.requires_grad for p in unet_to_check.parameters()):
-        # Get unfrozen U-Net parameters
+    unet_lr = args.controlnet_train.get("unet_lr", None)
+
+    if is_stage3:
+        # Stage 3: Only optimize U-Net (ControlNet is frozen)
+        # Use the same lr for U-Net as specified in config
+        unet_lr = args.controlnet_train["lr"]  # Use the main lr for U-Net in Stage 3
         unet_params = [p for p in unet_to_check.parameters() if p.requires_grad]
-        params.append({"params": unet_params, "lr": unet_lr})
-        logger.info(f"Two-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}, U-Net LR={unet_lr:.2e}")
+        params = [{"params": unet_params, "lr": unet_lr}]
+        logger.info(f"Stage 3: U-Net only optimizer, LR={unet_lr:.2e}")
+        logger.info(f"Stage 3: ControlNet frozen (not optimized)")
     else:
-        logger.info(f"Single-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}")
+        # Standard: Optimize ControlNet + optionally U-Net
+        params = [{"params": controlnet.parameters(), "lr": args.controlnet_train["lr"]}]
+        # Add U-Net parameters if any are unfrozen
+        if unet_lr and any(p.requires_grad for p in unet_to_check.parameters()):
+            # Get unfrozen U-Net parameters
+            unet_params = [p for p in unet_to_check.parameters() if p.requires_grad]
+            params.append({"params": unet_params, "lr": unet_lr})
+            logger.info(f"Two-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}, U-Net LR={unet_lr:.2e}")
+        else:
+            logger.info(f"Single-stage optimizer: ControlNet LR={args.controlnet_train['lr']:.2e}")
 
     optimizer = torch.optim.AdamW(params)
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
@@ -517,8 +557,14 @@ def train_controlnet(
     total_step = 0
     best_loss = 1e4
 
-    controlnet.train()
-    unet.eval()
+    if is_stage3:
+        # Stage 3: ControlNet is frozen, set to eval mode
+        controlnet.eval()
+        unet.train()  # U-Net should be in train mode
+        logger.info("Stage 3: ControlNet in eval mode (frozen), U-Net in train mode")
+    else:
+        controlnet.train()
+        unet.eval()
     prev_time = time.time()
     for epoch in range(n_epochs):
         global_epoch = start_epoch + epoch  # Global epoch number for logging
@@ -559,6 +605,9 @@ def train_controlnet(
                 # Get pre-contrast images from batch for dual-channel ControlNet condition
                 pre_images = batch["pre"].to(device)  # [B, 1, 256, 256, 256]
 
+                # Stage 3: Use unconditional generation (no ControlNet)
+                use_uncond = is_stage3
+
                 (
                     model_output,
                     model_block1_output,
@@ -568,12 +617,13 @@ def train_controlnet(
                     controlnet,unet,
                     spacing_tensor,
                     pre_images=pre_images,
-                    apply_morphological_perturb=True,
+                    apply_morphological_perturb=not use_uncond,  # No augmentation in Stage 3
                     modality_tensor=modality_tensor,
                     top_region_index_tensor=top_region_index_tensor,
                     bottom_region_index_tensor=bottom_region_index_tensor,
                     return_controlnet_blocks=False,
-                    use_checkpoint=True  # Enable gradient checkpointing to avoid inplace errors
+                    use_checkpoint=True,  # Enable gradient checkpointing to avoid inplace errors
+                    use_unconditional=use_uncond  # Stage 3: unconditional generation
                 )
 
                 if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
@@ -769,7 +819,8 @@ def train_controlnet(
                                     pre_images=val_pre_images,
                                     apply_morphological_perturb=False,  # No augmentation during validation
                                     modality_tensor=val_modality_tensor,
-                                    use_checkpoint=True  # Enable gradient checkpointing to avoid inplace errors
+                                    use_checkpoint=True,  # Enable gradient checkpointing to avoid inplace errors
+                                    use_unconditional=is_stage3  # Stage 3: unconditional validation
                                 )
 
                                 if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
@@ -843,7 +894,12 @@ def train_controlnet(
                     )
                     val_loss = None
 
-                controlnet.train()
+                # Restore train/eval mode after validation
+                if is_stage3:
+                    controlnet.eval()
+                    unet.train()
+                else:
+                    controlnet.train()
 
             # Save checkpoint for this epoch
             controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
