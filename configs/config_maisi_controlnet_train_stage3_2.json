@@ -1,10 +1,10 @@
 {
     "controlnet_train": {
-        "batch_size": 4,
+        "batch_size": 8,
         "cache_rate": 0.0,
         "fold": 0,
         "lr": 5e-5,
-        "n_epochs": 50,
+        "n_epochs": 30,
         "unet_blocks_to_unfreeze": [
             "down_blocks.3",
             "middle_block",
@@ -14,7 +14,7 @@
         "disable_inplace_for_checkpointing": true,
         "validation_frequency": 1,
         "weighted_loss_label": [129],
-        "weighted_loss": 100
+        "weighted_loss": 20
     },
     "controlnet_infer": {
        "num_inference_steps": 30,

@@ -162,7 +162,7 @@ breast-sub-gen/
 #### Stage 3.3: Mid-level Texture Release (Epoch 100-150)
 - **Unfreeze追加**: `["down_blocks.2", "down_blocks.3", "middle_block", "up_blocks.0", "up_blocks.1"]`
 - **ControlNet LR**: `1e-5`
-- **U-Net LR**: `5e-6`
+- **U-Net LR**: `1e-5`
 
 #### Stage 3.4: Full Refinement (Epoch 150-200)
 - **Unfreeze**: All U-Net blocks (Full Unfreeze)
