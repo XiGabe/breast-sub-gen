@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**3D breast MRI subtraction synthesis** using ControlNet + RFlow diffusion model.
+**3D breast MRI subtraction synthesis** using Cascade V2.0 architecture:
+- **Stage 0**: 3D Locator (nnU-Net) for tumor detection
+- **Stage 1**: Dual-channel ControlNet + RFlow diffusion model for high-fidelity rendering
 
 **Architecture**: Pre-contrast MRI + Tumor Mask → [VAE encode] → Latent Space → [ControlNet + U-Net] → Predicted Subtraction → [VAE decode] → Subtraction Image
 
@@ -48,6 +50,7 @@ breast-sub-gen/
 │   ├── processed_mask/         # Tumor masks (256³, 1-ch)
 │   └── dataset_breast_cached.json  # Dataset JSON
 ├── models/                     # Model checkpoints
+│   └── locator/               # nnU-Net locator models
 ├── weights/
 │   ├── autoencoder_v2.pt       # Pre-trained VAE
 │   └── diff_unet_3d_rflow-mr.pt # Pre-trained diffusion U-Net
@@ -58,29 +61,193 @@ breast-sub-gen/
 
 ---
 
-## Training Strategy
+## Training Pipeline (Cascade V2.0)
 
-### Stage 1: ControlNet Alignment (Epochs 1-50)
-- **U-Net**: Fully frozen
-- **ControlNet LR**: 1e-4
-- **LR Schedule**: Warmup (5%) + Cosine Annealing
-- **Validation**: Every epoch
-- **Loss**: Weighted MSE (ROI: 5.0, Background: 1.0)
+### Stage 0: Data Pipeline & Safety Check
 
-### Stage 2: Deep Semantic Release (Epochs 51-100)
-- **Unfreeze**: Deep U-Net blocks
-- **ControlNet LR**: 5e-5 | **U-Net LR**: 3e-5
+- [ ] **0.1 VAE Normalization & Offline Caching**
+    - **Target**: Subtraction (Sub) encoded via VAE to $64^3$ latent, values mapped to `[-1, 1]` (apply `Sub * 2.0 - 1.0` before encoding)
+    - **Output**: `[-1, 1]`, convert to `[0, 1]` after decoding
+    - **Cached files**: `sub_emb.nii.gz` ($64^3$, 4-ch); Pre and Mask at original $256^3$ (1-ch each)
 
-### Stage 3: Shallow Edge Refinement (Epochs 101+)
-- **Unfreeze**: All U-Net blocks
-- **ControlNet LR**: 3e-5 | **U-Net LR**: 1e-5
+- [ ] **0.2 Disable Spatial Augmentation**
+    - **Action**: Remove all spatial deformations (RandomCrop, RandomAffine, RandomFlip)
+    - **Rationale**: Ensure absolute spatial alignment between $256^3$ physical images and $64^3$ latents
+    - **Alternative**: Apply intensity augmentation only on Pre (RandGaussianNoise 15%, RandAdjustContrast 20%)
+
+- [ ] **0.3 Patient-level Dataset JSON**
+    - **Structure**: `{"image": "sub_emb.nii.gz", "condition": "pre_norm.nii.gz", "label": "mask.nii.gz"}`
+    - **Split**: Strict 3-layer stratified sampling (Dataset → Tumor Status → Patient ID) to prevent data leakage
+
+---
+
+### Stage 1: 3D Tumor Locator (The Locator)
+
+*Goal: Train a dedicated 3D segmentation network to detect anatomical abnormalities in pre-contrast MRI, eliminating dependency on expert masks.*
+
+- [ ] **1.1 Select and Configure Locator Network**
+    - **Tools**: nnU-Net v2 (recommended) or MONAI DynUNet
+    - **Input/Output**: Input 1ch $256^3$ Pre-contrast → Output 1ch $256^3$ Predicted Mask
+
+- [ ] **1.2 Set Up Highly Imbalanced Segmentation Loss**
+    - **Action**: Use `Dice Loss + Focal Loss` combo to handle 99% background vs 1% tiny tumors
+
+- [ ] **1.3 Evaluate Predictions**
+    - **Expectation**: Perfect 100% detection not required; acceptable if the locator roughly框出位置 (框出大概位置即可)
+
+---
+
+### Stage 2: Architecture & Loss Refactoring
+
+- [x] **2.1 Network Config** (`configs/config_network_rflow.json`)
+    - `conditioning_embedding_in_channels`: **2** (dual-channel: Pre + Mask)
+
+- [x] **2.2 ControlNet Input with Mask Perturbation** (`scripts/train_controlnet.py`)
+
+    ```python
+    pre_images = batch["pre"].to(device)
+    masks = batch["label"].to(device)
+
+    # 30% probability for morphological perturbation (simulate Locator errors)
+    if torch.rand(1).item() < 0.3:
+        masks = apply_random_morphological_perturbation(masks)
+
+    # Concatenate: [B, 2, 256, 256, 256]
+    controlnet_cond = torch.cat([pre_images.float(), masks.float()], dim=1)
+    ```
+
+- [x] **2.3 High-Fidelity Weighted L1 Loss**
+
+    ```python
+    # 1. Precise downsampling with Max Pooling (preserve tiny tumor pixels)
+    # 256³ -> 64³ (strict 4x reduction, no overlap)
+    # If any tumor pixel exists in 4x4x4 region, set latent point to True
+    roi_mask_latent = F.max_pool3d(batch["label"].float(), kernel_size=4, stride=4) > 0.0
+
+    # 2. Base L1 Loss (following MAISI official diffusion training)
+    raw_l1_loss = F.l1_loss(model_output.float(), model_gt.float(), reduction="none")
+
+    # 3. Dynamic Gradient Balancing
+    weight_mask = torch.ones_like(raw_l1_loss)
+
+    # 4. Solve 3D sparsity (100x strong boost)
+    # Tumor occupies ~0.07% in latent space; 100x weight boosts gradient contribution to ~7%
+    if roi_mask_latent.sum() > 0:
+        roi_mask_expanded = roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)
+        weight_mask[roi_mask_expanded] = args.controlnet_train["weighted_loss"]
+
+    # 5. Final Loss (unbiased)
+    loss = (raw_l1_loss * weight_mask).mean()
+    ```
+
+---
+
+### Stage 3: Progressive Co-Tuning (Cascade Renderer)
+
+*Goal: Abandon unconditional pretraining; use GT Mask as spatial constraint. Four-step strategy: "Learn path → Change semantics → Add texture → Refine details".*
+
+#### Stage 3.1: ControlNet Anchor Phase (Epoch 0-50)
+- **U-Net**: Fully frozen (100% frozen)
+- **ControlNet LR**: `1e-4`
+- **U-Net LR**: `0.0`
+- **ROI Weight**: `weighted_loss = 100` (required, force focus on 1% positive region)
+- **Batch**: 4
+
+#### Stage 3.2: Bottleneck Adaptation (Epoch 50-100)
+- **Unfreeze**: `["down_blocks.3", "middle_block", "up_blocks.0"]`
+- **ControlNet LR**: `5e-5`
+- **U-Net LR**: `1e-5` (must be 10x smaller than ControlNet LR)
+- **Batch**: 4, enable `gradient_checkpointing`
+
+#### Stage 3.3: Mid-level Texture Release (Epoch 100-150)
+- **Unfreeze追加**: `["down_blocks.2", "down_blocks.3", "middle_block", "up_blocks.0", "up_blocks.1"]`
+- **ControlNet LR**: `1e-5`
+- **U-Net LR**: `5e-6`
+
+#### Stage 3.4: Full Refinement (Epoch 150-200)
+- **Unfreeze**: All U-Net blocks (Full Unfreeze)
+- **ControlNet LR**: `5e-6`
+- **U-Net LR**: `1e-6` to `5e-6` (extremely conservative)
+
+---
+
+### Stage 4: Fully Automated Inference
+
+- [ ] **4.1 CFG-free Inference**
+    - **Action**: Since unconditional generation is abandoned, force `guidance_scale = 1.0`
+
+- [ ] **4.2 Cascade Inference Pipeline**
+    - **Step 1**: Input unknown Pre-contrast → **Locator (3D nnU-Net)** → Get `Predicted Mask`
+    - **Step 2**: Concatenate Pre + Predicted Mask → **Renderer (MAISI)** → Get `Predicted Subtraction`
+    - **Step 3**: Compute `Post_syn = Pre_raw + Sub_pred` (ensure inverse transform back to physical intensity)
+
+---
+
+## Architecture Diagram
+
+```
+========================================================================================
+                      【Stage 1: 3D Semantic Locator】
+========================================================================================
+                                     |
+   [ Unknown Pre-contrast MRI ] --------+
+   (Physical: 1ch, 256³)             |
+                                     V
+                     +-------------------------------+
+                     |   3D nnU-Net / DynUNet        |  <-- (Dice+Focal Loss)
+                     |   (Extract anatomical clues) |
+                     +-------------------------------+
+                                     |
+                                     V
+                        [ Predicted 3D Tumor Mask ]
+                        (Physical: 1ch, 256³)
+
+========================================================================================
+                      【Stage 2: 3D High-Fidelity Renderer】
+========================================================================================
+
+   [ Pre-contrast ] --------------+       +-------------- [ Predicted Mask ]
+   (1ch, 256³)                    |       |               (1ch, 256³)
+                                  V       V
+                            ( torch.cat dim=1 )
+                                      |
+                     [ Joint Condition Input (2ch, 256³) ]
+                                      |
+       +--------------------------------------------------------------+
+       | MAISI ControlNet (Condition Encoding)                       |
+       | Step Conv: 2ch -> 16ch -> 32ch -> 64ch (down to 64³)        |
+       +--------------------------------------------------------------+
+                                      |
+                                      V
+       +--------------------------------------------------------------+
+       | MAISI 3D Diffusion Transformer (U-Net)                       |
+       | (Latent 64³ with Progressive Unfreeze)                      |
+       +--------------------------------------------------------------+
+                                      |
+                                      V
+                           [ Predicted Sub_Latent ]
+                                      |
+       +--------------------------------------------------------------+
+       | VAE Decoder (64³ latent -> Physical space)                 |
+       +--------------------------------------------------------------+
+                                      |
+                                      V
+                       [ Predicted 3D Subtraction ]
+                               (1ch, 256³)
+                                      |
+                     ( Post = Pre + Predicted Subtraction )
+                                      |
+                                      V
+                   🌟 【Final Output: High-Fidelity 3D Virtual Enhanced MRI】 🌟
+========================================================================================
+```
 
 ---
 
 ## Training Commands
 
 ```bash
-# Stage 1
+# Stage 3.1 (ControlNet Anchor)
 sbatch scripts/submit_stage1.sh
 
 # Manual start
@@ -89,32 +256,6 @@ python -m scripts.train_controlnet \
     --model_config_path configs/config_maisi_controlnet_train_stage1.json \
     --model_def_path configs/config_network_rflow.json \
     --num_gpus 1
-```
-
----
-
-## Architecture Notes
-
-### ControlNet Input (Dual-Channel)
-
-```python
-# Dual-channel condition: [Pre-contrast MRI, Tumor Mask]
-controlnet_cond = torch.cat([pre_images, masks], dim=1)
-# Output: [B, 2, 256, 256, 256]
-```
-
-### Loss Function (Weighted MSE)
-
-```python
-# ROI masking (256³ -> 64³)
-roi_mask_latent = F.max_pool3d(labels, kernel_size=4, stride=4) > 0.0
-
-# MSE loss with ROI weighting
-raw_mse_loss = F.l1_loss(model_output, model_gt, reduction="none")
-weight_mask = torch.ones_like(raw_mse_loss)
-weight_mask[roi_mask_latent.repeat(1, 4, 1, 1, 1)] = 100.0
-
-loss = (raw_mse_loss * weight_mask).mean()
 ```
 
 ---
@@ -129,15 +270,17 @@ Key parameters:
 - `conditioning_embedding_in_channels`: **2** (dual-channel: Pre + Mask)
 - `latent_channels`: 4
 - `num_class_embeds`: 128
+- `weighted_loss`: **100** (ROI region weight)
 
 ---
 
 ## Important Constraints
 
-1. **NO spatial augmentation** during training
+1. **NO spatial augmentation** during training (only intensity augmentation on Pre)
 2. **Patient-level splits** critical - no data leakage
-3. **CFG Guidance**: Use `cfg_guidance_scale = 0` or `1.0` only
-4. **Stage 2+ requires gradient checkpointing**
+3. **CFG Guidance**: Use `guidance_scale = 1.0` only (no unconditional generation)
+4. **Stage 3.2+ requires gradient checkpointing**
+5. **Mask perturbation**: 30% probability for morphological augmentation
 
 ---
 

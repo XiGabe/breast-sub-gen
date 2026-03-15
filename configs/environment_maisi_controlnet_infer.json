@@ -1,0 +1,21 @@
+{
+    "model_dir": "./models/",
+    "output_dir": "./outputs/inference_final",
+    "tfevent_path": "./outputs/tfevent",
+    "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
+    "trained_diffusion_path": "./weights/diff_unet_3d_rflow-mr.pt",
+    "trained_controlnet_path": "./models/breast_controlnet_stage3_4_best.pt",
+    "existing_ckpt_filepath": "./models/breast_controlnet_stage3_4_best.pt",
+    "exp_name": "breast_controlnet_final_infer",
+    "start_epoch": 1,
+    "data_base_dir": ["./data/"],
+    "json_data_list": ["./data/dataset_breast_cached.json"],
+    "modality_mapping_path": "./configs/modality_mapping_breast.json",
+    "controlnet_infer": {
+       "num_inference_steps": 30,
+       "autoencoder_sliding_window_infer_size": [160, 160, 64],
+       "autoencoder_sliding_window_infer_overlap": 0.5,
+       "modality": 9,
+       "cfg_guidance_scale": 1.0
+    }
+}
