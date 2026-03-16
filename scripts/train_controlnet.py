@@ -588,6 +588,9 @@ def train_controlnet(
     for epoch in range(n_epochs):
         global_epoch = start_epoch + epoch  # Global epoch number for logging
         epoch_loss_ = 0
+        epoch_base_l1_loss = 0
+        epoch_bg_bright_penalty = 0
+        epoch_mean_balance_loss = 0
         valid_batches = 0  # Track number of valid (non-NaN) batches
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -656,7 +659,7 @@ def train_controlnet(
                         f"[{DDPMPredictionType.EPSILON},{DDPMPredictionType.SAMPLE},{DDPMPredictionType.V_PREDICTION}]",
                     )
     
-                # ========== Pure Weighted L1 Loss (MAISI Official Implementation) ==========
+                # ========== New Multi-Component Loss ==========
                 # 1. Precise dimension reduction using Max Pooling (preserves ANY tiny lesion!)
                 # labels: [B, 1, 256, 256, 256] -> roi_mask_latent: [B, 1, 64, 64, 64]
                 roi_mask_latent = F.max_pool3d(labels.float(), kernel_size=4, stride=4) > 0.0
@@ -670,12 +673,35 @@ def train_controlnet(
                 # - Background: weight = 1.0 (standard diffusion loss - preserves vessels!)
                 # - Tumor ROI: weight = {roi_weight} (high priority on tumor accuracy)
                 weight_mask = torch.ones_like(raw_l1_loss)
+                roi_mask_expanded = None
                 if roi_mask_latent.sum() > 0:
                     roi_mask_expanded = roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)
                     weight_mask[roi_mask_expanded] = roi_weight
 
-                # 4. Final weighted loss
-                loss = (raw_l1_loss * weight_mask).mean()
+                # ========== New Multi-Component Loss ==========
+                # 1. Base weighted L1 loss (weight=1.0)
+                base_l1_loss = (raw_l1_loss * weight_mask).mean()
+
+                # 2. Background brightening penalty (weight=2.0)
+                # Penalize brightening in non-tumor regions
+                # - With tumor: only penalize non-tumor areas (roi_mask_expanded = 1 for tumor)
+                # - Without tumor: penalize all areas (all regions are "background")
+                if roi_mask_expanded is not None and roi_mask_expanded.sum() > 0:
+                    bg_mask = (1 - roi_mask_expanded.float())
+                else:
+                    bg_mask = torch.ones_like(model_output)
+                bg_bright_penalty = torch.mean(F.relu(model_output - model_gt) * bg_mask)
+
+                # 3. Global mean balance loss (weight=0.5)
+                mean_balance_loss = torch.abs(model_output.mean() - model_gt.mean())
+
+                # 4. Combined loss
+                loss = 1.0 * base_l1_loss + 2.0 * bg_bright_penalty + 0.5 * mean_balance_loss
+
+                # Store individual losses for logging
+                base_l1_loss_val = base_l1_loss.detach()
+                bg_bright_penalty_val = bg_bright_penalty.detach()
+                mean_balance_loss_val = mean_balance_loss.detach()
 
             # Check for NaN loss before backward pass
             loss_value = loss.detach().cpu().item()
@@ -705,11 +731,19 @@ def train_controlnet(
             # Track epoch-level loss for CSV logging
             epoch_loss_ += loss.detach()
 
+            # Track individual losses
+            epoch_base_l1_loss += base_l1_loss_val
+            epoch_bg_bright_penalty += bg_bright_penalty_val
+            epoch_mean_balance_loss += mean_balance_loss_val
+
             if rank == 0:
                 # write train loss for each batch into tensorboard
                 tensorboard_writer.add_scalar(
                     "train/train_controlnet_loss_iter", loss_value, total_step
                 )
+                tensorboard_writer.add_scalar("train/base_l1_loss_iter", base_l1_loss_val.item(), total_step)
+                tensorboard_writer.add_scalar("train/bg_bright_penalty_loss_iter", bg_bright_penalty_val.item(), total_step)
+                tensorboard_writer.add_scalar("train/mean_balance_loss_iter", mean_balance_loss_val.item(), total_step)
                 batches_done = step + 1
                 batches_left = len(train_loader) - batches_done
                 time_left = timedelta(seconds=batches_left * (time.time() - prev_time))
@@ -752,10 +786,16 @@ def train_controlnet(
         # Calculate epoch average, accounting for skipped batches
         if valid_batches > 0:
             epoch_loss = epoch_loss_ / valid_batches
+            epoch_base_l1 = epoch_base_l1_loss / valid_batches
+            epoch_bg_bright = epoch_bg_bright_penalty / valid_batches
+            epoch_mean_balance = epoch_mean_balance_loss / valid_batches
         else:
             # All batches were skipped (NaN), use previous loss or skip this epoch
             logger.warning(f"[Epoch {global_epoch}/{start_epoch + n_epochs - 1}] All batches skipped due to NaN loss!")
             epoch_loss = torch.tensor(0.0)  # Placeholder
+            epoch_base_l1 = torch.tensor(0.0)
+            epoch_bg_bright = torch.tensor(0.0)
+            epoch_mean_balance = torch.tensor(0.0)
 
         # Print newline and summary after epoch
         if rank == 0:
@@ -771,6 +811,9 @@ def train_controlnet(
 
         if rank == 0:
             tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
+            tensorboard_writer.add_scalar("train/base_l1_loss_epoch", epoch_base_l1.cpu().item(), total_step)
+            tensorboard_writer.add_scalar("train/bg_bright_penalty_loss_epoch", epoch_bg_bright.cpu().item(), total_step)
+            tensorboard_writer.add_scalar("train/mean_balance_loss_epoch", epoch_mean_balance.cpu().item(), total_step)
 
             # Validation loop (if enabled)
             val_loss = None

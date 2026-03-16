@@ -1,0 +1,14 @@
+{
+    "model_dir": "./models/",
+    "output_dir": "./outputs",
+    "tfevent_path": "./outputs/tfevent",
+    "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
+    "trained_diffusion_path": "./weights/diff_unet_3d_rflow-mr.pt",
+    "existing_ckpt_filepath": "./models/breast_controlnet_stage3_1_epoch_50.pt",
+    "trained_controlnet_path": "./models/breast_controlnet_stage3_1_epoch_50.pt",
+    "exp_name": "breast_controlnet_stage3_6",
+    "start_epoch": 111,
+    "data_base_dir": ["./data/"],
+    "json_data_list": ["./data/dataset_breast_cached.json"],
+    "modality_mapping_path": "./configs/modality_mapping_breast.json"
+}
