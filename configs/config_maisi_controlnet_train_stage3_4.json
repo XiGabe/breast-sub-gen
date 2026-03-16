@@ -1,24 +1,26 @@
 {
     "controlnet_train": {
-        "batch_size": 8,
+        "batch_size": 4,
         "cache_rate": 0.0,
         "fold": 0,
-        "lr": 1e-5,
-        "n_epochs": 40,
+        "lr": 5e-6,
+        "n_epochs": 50,
         "unet_blocks_to_unfreeze": [
+            "down_blocks.0",
             "down_blocks.1",
             "down_blocks.2",
             "down_blocks.3",
             "middle_block",
             "up_blocks.0",
             "up_blocks.1",
-            "up_blocks.2"
+            "up_blocks.2",
+            "up_blocks.3"
         ],
-        "unet_lr": 8e-6,
+        "unet_lr": 1e-6,
         "disable_inplace_for_checkpointing": true,
         "validation_frequency": 1,
         "weighted_loss_label": [129],
-        "weighted_loss": 20
+        "weighted_loss": 100
     },
     "controlnet_infer": {
        "num_inference_steps": 30,

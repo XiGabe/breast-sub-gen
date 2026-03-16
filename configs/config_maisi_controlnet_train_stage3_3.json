@@ -1,6 +1,6 @@
 {
     "controlnet_train": {
-        "batch_size": 8,
+        "batch_size": 4,
         "cache_rate": 0.0,
         "fold": 0,
         "lr": 1e-5,
@@ -16,7 +16,7 @@
         "disable_inplace_for_checkpointing": true,
         "validation_frequency": 1,
         "weighted_loss_label": [129],
-        "weighted_loss": 20
+        "weighted_loss": 100
     },
     "controlnet_infer": {
        "num_inference_steps": 30,

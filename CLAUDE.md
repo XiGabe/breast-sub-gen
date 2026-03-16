@@ -144,46 +144,30 @@ breast-sub-gen/
 
 ### Stage 3: Progressive Co-Tuning (Cascade Renderer)
 
-*Goal: Abandon unconditional pretraining; use GT Mask as spatial constraint. Five-step progressive strategy.*
+*Goal: Abandon unconditional pretraining; use GT Mask as spatial constraint. Four-step strategy: "Learn path → Change semantics → Add texture → Refine details".*
 
-#### Stage 3.1: ControlNet 独立探路期 (The Anchor Phase | Epoch 0-50)
-- **目标**: 构建安全锚点。U-Net 绝对冻结，强迫 ControlNet 专心学习双通道 cat(Pre, Mask) 的空间坐标映射
-- **U-Net**: 100% frozen
-- **Unfreeze**: `[]`
+#### Stage 3.1: ControlNet Anchor Phase (Epoch 0-50)
+- **U-Net**: Fully frozen (100% frozen)
 - **ControlNet LR**: `1e-4`
 - **U-Net LR**: `0.0`
-- **ROI Weight**: `weighted_loss = 100` (强制关注 1% 阳性区域)
+- **ROI Weight**: `weighted_loss = 100` (required, force focus on 1% positive region)
 - **Batch**: 4
 
-#### Stage 3.2: 深层语义适应期 (Bottleneck Adaptation | Epoch 51-70)
-- **目标**: 解决"均值稀释"黑洞。在 ControlNet 提供的精准空间信号指引下，放开 U-Net 的深层瓶颈
+#### Stage 3.2: Bottleneck Adaptation (Epoch 50-100)
 - **Unfreeze**: `["down_blocks.3", "middle_block", "up_blocks.0"]`
 - **ControlNet LR**: `5e-5`
-- **U-Net LR**: `1e-5` (必须比 ControlNet 小 10 倍)
-- **ROI Weight**: `weighted_loss = 20`
+- **U-Net LR**: `1e-5` (must be 10x smaller than ControlNet LR)
 - **Batch**: 4, enable `gradient_checkpointing`
 
-#### Stage 3.3: 中层纹理过渡期 (Mid-level Texture Release | Epoch 71-90)
-- **目标**: 释放中层特征路由。让中层网络学习造影剂的异质性分布
-- **Unfreeze 追加**: `["down_blocks.2", "down_blocks.3", "middle_block", "up_blocks.0", "up_blocks.1"]`
+#### Stage 3.3: Mid-level Texture Release (Epoch 100-150)
+- **Unfreeze追加**: `["down_blocks.2", "down_blocks.3", "middle_block", "up_blocks.0", "up_blocks.1"]`
 - **ControlNet LR**: `1e-5`
-- **U-Net LR**: `5e-6`
-- **ROI Weight**: `weighted_loss = 20`
+- **U-Net LR**: `1e-5`
 
-#### Stage 3.4: 次浅层高频引入期 (High-Frequency Injection | Epoch 91-130)
-- **目标**: 攻克高难度病灶 (如毛刺边缘、局灶血管)。释放次浅层的 down.1 和 up.2
-- **Unfreeze**: `["down_blocks.1", "down_blocks.2", "down_blocks.3", "middle_block", "up_blocks.0", "up_blocks.1", "up_blocks.2"]`
-- **ControlNet LR**: `1e-5` (保持高推力，防止局部最优)
-- **U-Net LR**: `5e-6` 到 `8e-6`
-- **ROI Weight**: `weighted_loss = 20`
-- **注意**: 必须启用 Cosine Annealing 和至少 500 步 Warmup，防止梯度爆炸
-
-#### Stage 3.5: 全解封极限画质期 (Full Refinement | Epoch 131-180)
-- **目标**: 打通全局梯度，终极画质释放。让最浅层参与进来，解决最后的稀疏性问题
-- **Unfreeze**: Full Unfreeze (全部 blocks)
+#### Stage 3.4: Full Refinement (Epoch 150-200)
+- **Unfreeze**: All U-Net blocks (Full Unfreeze)
 - **ControlNet LR**: `5e-6`
-- **U-Net LR**: `1e-6` 到 `2e-6` (极度保守)
-- **ROI Weight**: `weighted_loss = 20`
+- **U-Net LR**: `1e-6` to `5e-6` (extremely conservative)
 
 ---
 

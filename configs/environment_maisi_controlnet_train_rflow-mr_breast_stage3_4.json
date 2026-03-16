@@ -7,7 +7,7 @@
     "existing_ckpt_filepath": "./models/breast_controlnet_stage3_3_best.pt",
     "trained_controlnet_path": "./models/breast_controlnet_stage3_3_best.pt",
     "exp_name": "breast_controlnet_stage3_4",
-    "start_epoch": 91,
+    "start_epoch": 151,
     "data_base_dir": ["./data/"],
     "json_data_list": ["./data/dataset_breast_cached.json"],
     "modality_mapping_path": "./configs/modality_mapping_breast.json"

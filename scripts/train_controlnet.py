@@ -12,7 +12,6 @@
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -493,7 +492,7 @@ def train_controlnet(
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
 
-    # Improved learning rate scheduler: Warmup + Cosine Annealing (per param group)
+    # Improved learning rate scheduler: Warmup + Cosine Annealing
     from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
     n_epochs = args.controlnet_train["n_epochs"]
@@ -501,79 +500,15 @@ def train_controlnet(
     warmup_steps = warmup_epochs * len(train_loader)
     main_scheduler_steps = total_steps - warmup_steps
 
-    # Warmup for all param groups
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_scheduler_steps, eta_min=0.0)
 
-    # Cosine Annealing with different min LR per param group
-    # ControlNet: min_lr = lr / 10, U-Net: min_lr = unet_lr / 10
-    controlnet_lr = args.controlnet_train["lr"]
-    unet_lr = args.controlnet_train.get("unet_lr", None)
-
-    def cosine_annealing_with_warmup(step):
-        if step < warmup_steps:
-            # Linear warmup
-            return (step / warmup_steps) * 0.9 + 0.1  # 0.1 -> 1.0
-        else:
-            # Cosine annealing after warmup
-            progress = (step - warmup_steps) / main_scheduler_steps
-            return 0.5 * (1 + math.cos(math.pi * progress))
-
-    # Create LambdaLR for each param group with different min LR
-    def make_cosine_scheduler(optimizer, base_lr, min_lr_factor):
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return (step / warmup_steps) * 0.9 + 0.1  # Linear warmup: 0.1 -> 1.0
-            else:
-                progress = (step - warmup_steps) / main_scheduler_steps
-                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                return min_lr_factor + (1.0 - min_lr_factor) * cosine_factor
-        return lr_lambda
-
-    if unet_lr and len(optimizer.param_groups) > 1:
-        # Two param groups: ControlNet and U-Net
-        lr_lambda_cn = make_cosine_scheduler(optimizer, controlnet_lr, 0.1)
-        lr_lambda_unet = make_cosine_scheduler(optimizer, unet_lr, 0.1)
-
-        # Wrap to apply different lambdas to different param groups
-        class MultiParamGroupLR:
-            def __init__(self, lambdas):
-                self.lambdas = lambdas
-            def step(self, step):
-                for pg, lam in zip(optimizer.param_groups, self.lambdas):
-                    pg['lr'] = pg['initial_lr'] * lam(step)
-
-        cosine_scheduler = MultiParamGroupLR([lr_lambda_cn, lr_lambda_unet])
-        logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs)")
-        logger.info(f"  ControlNet: {controlnet_lr:.2e} -> {controlnet_lr/10:.2e}")
-        logger.info(f"  U-Net: {unet_lr:.2e} -> {unet_lr/10:.2e}")
-    else:
-        # Single param group: ControlNet only
-        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_scheduler_steps, eta_min=controlnet_lr / 10)
-        logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs)")
-        logger.info(f"  ControlNet: {controlnet_lr:.2e} -> {controlnet_lr/10:.2e}")
-
-    # Create a wrapper to handle both scheduler types
-    class CombinedScheduler:
-        def __init__(self, warmup, cosine):
-            self.warmup = warmup
-            self.cosine = cosine
-            self.step_count = 0
-        def step(self):
-            self.step_count += 1
-            if self.step_count <= warmup_steps:
-                self.warmup.step()
-            else:
-                # Check if custom scheduler's step method requires a step argument
-                import inspect
-                sig = inspect.signature(self.cosine.step)
-                if len(sig.parameters) > 0:
-                    self.cosine.step(self.step_count)
-                else:
-                    self.cosine.step()
-        def get_last_lr(self):
-            return [pg['lr'] for pg in optimizer.param_groups]
-
-    lr_scheduler = CombinedScheduler(warmup_scheduler, cosine_scheduler)
+    lr_scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
+    )
+    logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs)")
 
     # Step 4: training
     n_epochs = args.controlnet_train["n_epochs"]
@@ -750,16 +685,14 @@ def train_controlnet(
                 prev_time = time.time()
 
                 # Console output: every batch (for real-time monitoring)
-                lrs = lr_scheduler.get_last_lr()
-                lr_str = f"CN:{lrs[0]:.2e}" if len(lrs) == 1 else f"CN:{lrs[0]:.2e}/UN:{lrs[1]:.2e}"
                 print(
-                    "\r[Epoch %d/%d] [Batch %d/%d] [%s] [loss: %.4f] ETA: %s "
+                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
                     % (
                         global_epoch,
                         start_epoch + n_epochs - 1,
                         step + 1,
                         len(train_loader),
-                        lr_str,
+                        lr_scheduler.get_last_lr()[0],
                         loss_value,
                         time_left,
                     ),
@@ -768,16 +701,14 @@ def train_controlnet(
 
                 # File output: every 100 batches (to keep log file manageable)
                 if (step + 1) % 100 == 0 or (step + 1) == len(train_loader):
-                    lrs = lr_scheduler.get_last_lr()
-                    lr_str = f"CN:{lrs[0]:.2e}" if len(lrs) == 1 else f"CN:{lrs[0]:.2e}/UN:{lrs[1]:.2e}"
                     logger.info(
-                        "[Epoch %d/%d] [Batch %d/%d] [%s] [Loss: %.4f] ETA: %s"
+                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Loss: %.4f] ETA: %s"
                         % (
                             global_epoch,
                             start_epoch + n_epochs - 1,
                             step + 1,
                             len(train_loader),
-                            lr_str,
+                            lr_scheduler.get_last_lr()[0],
                             loss_value,
                             time_left,
                         )
