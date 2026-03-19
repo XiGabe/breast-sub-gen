@@ -25,6 +25,8 @@ srun --partition=sablab-gpu --gres=gpu:a40:1 --mem=20G --cpus-per-task=4 --pty /
 ## Conda Environment
 
 ```bash
+# Source conda first (required for non-interactive shells)
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate breast_gen
 ```
 

@@ -3,7 +3,7 @@
         "batch_size": 8,
         "cache_rate": 0.0,
         "fold": 0,
-        "lr": 5e-6,
+        "lr": 1e-5,
         "n_epochs": 100,
         "unet_blocks_to_unfreeze": [
             "down_blocks.0",
@@ -16,11 +16,11 @@
             "up_blocks.2",
             "up_blocks.3"
         ],
-        "unet_lr": 2e-6,
+        "unet_lr": 2e-5,
         "disable_inplace_for_checkpointing": true,
         "validation_frequency": 1,
         "weighted_loss_label": [129],
-        "weighted_loss": 100
+        "weighted_loss": 1
     },
     "controlnet_infer": {
        "num_inference_steps": 30,

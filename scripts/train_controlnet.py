@@ -501,14 +501,19 @@ def train_controlnet(
     main_scheduler_steps = total_steps - warmup_steps
 
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_scheduler_steps, eta_min=0.0)
+    # Cosine annealing to 10% of initial LR (per param group)
+    # Use the minimum lr across all param groups (10% of the smallest initial lr)
+    min_initial_lr = min(pg["lr"] for pg in optimizer.param_groups)
+    eta_min = min_initial_lr * 0.1  # 10% of smallest initial lr
+    # T_max should be total_steps, not main_scheduler_steps, to ensure correct cosine annealing after warmup
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=int(total_steps), eta_min=eta_min)
 
     lr_scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_steps]
     )
-    logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs)")
+    logger.info(f"LR Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing ({n_epochs - warmup_epochs} epochs, min_lr=10% of initial)")
 
     # Step 4: training
     n_epochs = args.controlnet_train["n_epochs"]
@@ -523,9 +528,7 @@ def train_controlnet(
     for epoch in range(n_epochs):
         global_epoch = start_epoch + epoch  # Global epoch number for logging
         epoch_loss_ = 0
-        epoch_base_l1_loss = 0
-        epoch_bg_bright_penalty = 0
-        epoch_mean_balance_loss = 0
+        epoch_loss_sum = 0
         valid_batches = 0  # Track number of valid (non-NaN) batches
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -613,30 +616,11 @@ def train_controlnet(
                     roi_mask_expanded = roi_mask_latent.repeat(1, model_output.shape[1], 1, 1, 1)
                     weight_mask[roi_mask_expanded] = roi_weight
 
-                # ========== New Multi-Component Loss ==========
-                # 1. Base weighted L1 loss (weight=1.0)
-                base_l1_loss = (raw_l1_loss * weight_mask).mean()
+                # ========== Weighted L1 Loss ==========
+                loss = (raw_l1_loss * weight_mask).mean()
 
-                # 2. Background brightening penalty (weight=2.0)
-                # Penalize brightening in non-tumor regions
-                # - With tumor: only penalize non-tumor areas (roi_mask_expanded = 1 for tumor)
-                # - Without tumor: penalize all areas (all regions are "background")
-                if roi_mask_expanded is not None and roi_mask_expanded.sum() > 0:
-                    bg_mask = (1 - roi_mask_expanded.float())
-                else:
-                    bg_mask = torch.ones_like(model_output)
-                bg_bright_penalty = torch.mean(F.relu(model_output - model_gt) * bg_mask)
-
-                # 3. Global mean balance loss (weight=0.5)
-                mean_balance_loss = torch.abs(model_output.mean() - model_gt.mean())
-
-                # 4. Combined loss
-                loss = 1.0 * base_l1_loss + 2.0 * bg_bright_penalty + 0.5 * mean_balance_loss
-
-                # Store individual losses for logging
-                base_l1_loss_val = base_l1_loss.detach()
-                bg_bright_penalty_val = bg_bright_penalty.detach()
-                mean_balance_loss_val = mean_balance_loss.detach()
+                # Store loss for logging
+                loss_val = loss.detach()
 
             # Check for NaN loss before backward pass
             loss_value = loss.detach().cpu().item()
@@ -665,34 +649,32 @@ def train_controlnet(
 
             # Track epoch-level loss for CSV logging
             epoch_loss_ += loss.detach()
-
-            # Track individual losses
-            epoch_base_l1_loss += base_l1_loss_val
-            epoch_bg_bright_penalty += bg_bright_penalty_val
-            epoch_mean_balance_loss += mean_balance_loss_val
+            epoch_loss_sum += loss_val
 
             if rank == 0:
                 # write train loss for each batch into tensorboard
                 tensorboard_writer.add_scalar(
                     "train/train_controlnet_loss_iter", loss_value, total_step
                 )
-                tensorboard_writer.add_scalar("train/base_l1_loss_iter", base_l1_loss_val.item(), total_step)
-                tensorboard_writer.add_scalar("train/bg_bright_penalty_loss_iter", bg_bright_penalty_val.item(), total_step)
-                tensorboard_writer.add_scalar("train/mean_balance_loss_iter", mean_balance_loss_val.item(), total_step)
+                tensorboard_writer.add_scalar("train/loss_iter", loss_val.item(), total_step)
                 batches_done = step + 1
                 batches_left = len(train_loader) - batches_done
                 time_left = timedelta(seconds=batches_left * (time.time() - prev_time))
                 prev_time = time.time()
 
                 # Console output: every batch (for real-time monitoring)
+                current_lrs = lr_scheduler.get_last_lr()
+                lr_info = f"CN: {current_lrs[0]:.2e}"
+                if len(current_lrs) > 1:
+                    lr_info += f", UNet: {current_lrs[1]:.2e}"
                 print(
-                    "\r[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [loss: %.4f] ETA: %s "
+                    "\r[Epoch %d/%d] [Batch %d/%d] [%s] [loss: %.4f] ETA: %s "
                     % (
                         global_epoch,
                         start_epoch + n_epochs - 1,
                         step + 1,
                         len(train_loader),
-                        lr_scheduler.get_last_lr()[0],
+                        lr_info,
                         loss_value,
                         time_left,
                     ),
@@ -701,14 +683,18 @@ def train_controlnet(
 
                 # File output: every 100 batches (to keep log file manageable)
                 if (step + 1) % 100 == 0 or (step + 1) == len(train_loader):
+                    current_lrs = lr_scheduler.get_last_lr()
+                    lr_info = f"CN: {current_lrs[0]:.2e}"
+                    if len(current_lrs) > 1:
+                        lr_info += f", UNet: {current_lrs[1]:.2e}"
                     logger.info(
-                        "[Epoch %d/%d] [Batch %d/%d] [LR: %.8f] [Loss: %.4f] ETA: %s"
+                        "[Epoch %d/%d] [Batch %d/%d] [%s] [Loss: %.4f] ETA: %s"
                         % (
                             global_epoch,
                             start_epoch + n_epochs - 1,
                             step + 1,
                             len(train_loader),
-                            lr_scheduler.get_last_lr()[0],
+                            lr_info,
                             loss_value,
                             time_left,
                         )
@@ -717,16 +703,12 @@ def train_controlnet(
         # Calculate epoch average, accounting for skipped batches
         if valid_batches > 0:
             epoch_loss = epoch_loss_ / valid_batches
-            epoch_base_l1 = epoch_base_l1_loss / valid_batches
-            epoch_bg_bright = epoch_bg_bright_penalty / valid_batches
-            epoch_mean_balance = epoch_mean_balance_loss / valid_batches
+            epoch_loss_avg = epoch_loss_sum / valid_batches
         else:
             # All batches were skipped (NaN), use previous loss or skip this epoch
             logger.warning(f"[Epoch {global_epoch}/{start_epoch + n_epochs - 1}] All batches skipped due to NaN loss!")
             epoch_loss = torch.tensor(0.0)  # Placeholder
-            epoch_base_l1 = torch.tensor(0.0)
-            epoch_bg_bright = torch.tensor(0.0)
-            epoch_mean_balance = torch.tensor(0.0)
+            epoch_loss_avg = torch.tensor(0.0)
 
         # Print newline and summary after epoch
         if rank == 0:
@@ -739,12 +721,10 @@ def train_controlnet(
         if use_ddp:
             dist.barrier()
             dist.all_reduce(epoch_loss, op=torch.distributed.ReduceOp.AVG)
+            dist.all_reduce(epoch_loss_avg, op=torch.distributed.ReduceOp.AVG)
 
         if rank == 0:
-            tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
-            tensorboard_writer.add_scalar("train/base_l1_loss_epoch", epoch_base_l1.cpu().item(), total_step)
-            tensorboard_writer.add_scalar("train/bg_bright_penalty_loss_epoch", epoch_bg_bright.cpu().item(), total_step)
-            tensorboard_writer.add_scalar("train/mean_balance_loss_epoch", epoch_mean_balance.cpu().item(), total_step)
+            tensorboard_writer.add_scalar("train/loss_epoch", epoch_loss_avg.cpu().item(), total_step)
 
             # Validation loop (if enabled)
             val_loss = None
@@ -869,16 +849,15 @@ def train_controlnet(
                 if val_valid_batches > 0:
                     val_loss = val_loss_ / val_valid_batches
                     logger.info(
-                        f"[Epoch {global_epoch}] Validation COMPLETE: "
-                        f"Loss={val_loss:.4f} "
-                        f"({val_valid_batches} batches"
+                        f"[Epoch {global_epoch}] Train Loss: {epoch_loss_avg:.4f} | Validation Loss: {val_loss:.4f} "
+                        f"({val_valid_batches} batches)"
                     )
                     if val_skipped_batches > 0:
                         logger.info(
                             f"  Skipped: {val_skipped_batches} batches - "
                             f"reasons: {val_skip_reasons}"
                         )
-                    tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", val_loss.cpu().item(), total_step)
+                    tensorboard_writer.add_scalar("val/loss_epoch", val_loss.cpu().item(), total_step)
                 else:
                     logger.warning(
                         f"[Epoch {global_epoch}] All validation batches skipped! "
