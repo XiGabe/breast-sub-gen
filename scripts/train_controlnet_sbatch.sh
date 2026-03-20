@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=sablab-gpu
-#SBATCH --gres=gpu:a40:1
-#SBATCH --mem=60G
+#SBATCH --gres=gpu:a100:1
+#SBATCH --mem=80G
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=controlnet_train
 #SBATCH --output=logs/controlnet_train_%j.out

@@ -71,7 +71,7 @@ source /home/hoc4008/miniconda3/etc/profile.d/conda.sh && conda activate breast_
 - **Epochs**: 500
 - **Learning rate**: 1e-5
 - **Spacing**: [1.2, 0.7, 0.7] (Z, Y, X)
-- **Modality**: MRI (9)
+- **Modality**: MRI (8)
 - **Validation**: 390 samples (10% of data)
 
 ## Key Modifications Made
