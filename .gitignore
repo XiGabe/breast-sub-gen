@@ -9,3 +9,4 @@
 *.csv
 data/dataset_breast_cached.json
 data/dataset_breast.json
+.claude/.nfs0000000020086334000057de

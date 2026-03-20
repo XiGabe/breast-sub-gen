@@ -251,6 +251,9 @@ def add_data_dir2path(list_files: list, data_dir: str, fold: int = None) -> tupl
         if "label" in d:
             d["label"] = os.path.join(data_dir, d["label"])
 
+        if "pre" in d:
+            d["pre"] = os.path.join(data_dir, d["pre"])
+
         if fold is not None:
             if d["fold"] == fold:
                 new_list_files_val.append(copy.deepcopy(d))
@@ -301,13 +304,34 @@ def prepare_maisi_controlnet_json_dataloader(
             list_valid += val
     else:
         with open(json_data_list, "r") as f:
-            json_data = json.load(f)["training"]
-        list_train, list_valid = add_data_dir2path(json_data, data_base_dir, fold)
+            json_data = json.load(f)
+        # Check if dataset already has training/validation split
+        if "training" in json_data and "validation" in json_data:
+            # For datasets with pre-split train/val, just add path to each item
+            list_train = []
+            for d in copy.deepcopy(json_data["training"]):
+                d["image"] = os.path.join(data_base_dir, d["image"])
+                if "label" in d:
+                    d["label"] = os.path.join(data_base_dir, d["label"])
+                if "pre" in d:
+                    d["pre"] = os.path.join(data_base_dir, d["pre"])
+                list_train.append(d)
+            list_valid = []
+            for d in copy.deepcopy(json_data["validation"]):
+                d["image"] = os.path.join(data_base_dir, d["image"])
+                if "label" in d:
+                    d["label"] = os.path.join(data_base_dir, d["label"])
+                if "pre" in d:
+                    d["pre"] = os.path.join(data_base_dir, d["pre"])
+                list_valid.append(d)
+        else:
+            list_train, list_valid = add_data_dir2path(json_data["training"], data_base_dir, fold)
 
     common_transform = [
-        LoadImaged(keys=["image", "label"], image_only=True, ensure_channel_first=True),
-        Orientationd(keys=["label"], axcodes="RAS"),
-        EnsureTyped(keys=["label"], dtype=torch.long, track_meta=True),
+        LoadImaged(keys=["image", "label", "pre"], image_only=True, ensure_channel_first=True),
+        Orientationd(keys=["label", "pre"], axcodes="RAS"),
+        EnsureTyped(keys=["label"], dtype=torch.float32, track_meta=True),
+        EnsureTyped(keys=["pre"], dtype=torch.float32, track_meta=True),
         Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
         Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
         Lambdad(keys="spacing", func=lambda x: torch.FloatTensor(x)),

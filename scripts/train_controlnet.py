@@ -30,7 +30,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from .utils import binarize_labels, define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
+from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
 from .augmentation import remove_tumors
 
@@ -114,7 +114,7 @@ def compute_region_contrasive_loss(
     return loss_region_contrasive, loss_region_bg
 
 def compute_model_output(
-    images,labels,noise,timesteps,noise_scheduler,
+    images,labels,pre_tensor,noise,timesteps,noise_scheduler,
     controlnet,unet,
     spacing_tensor,
     modality_tensor=None,
@@ -127,7 +127,7 @@ def compute_model_output(
     the ControlNet intermediate blocks) for a given noisy latent and conditions.
 
     Pipeline:
-      1) Binarize labels to build ControlNet condition.
+      1) Concatenate pre-contrast MRI and tumor mask to build 2-channel ControlNet condition.
       2) Add noise to `images` at `timesteps` via the scheduler.
       3) Pass noisy latent and conditions to ControlNet to get down/mid features.
       4) Pass everything to U-Net (with spacing, optional modality & body-region
@@ -137,7 +137,9 @@ def compute_model_output(
         images (torch.Tensor):
             Input latent/image tensor to be noised. Shape [B, C, X, Y, Z].
         labels (torch.Tensor or monai.data.MetaTensor):
-            Segmentation labels used to create ControlNet condition.
+            Segmentation labels (tumor masks) used to create ControlNet condition.
+        pre_tensor (torch.Tensor):
+            Pre-contrast MRI tensor for ControlNet conditioning. Shape [B, 1, X, Y, Z].
         noise (torch.Tensor):
             Noise tensor aligned with `images`.
         timesteps (torch.Tensor or Any):
@@ -170,8 +172,11 @@ def compute_model_output(
     include_modality = ( modality_tensor is not None )
     include_body_region = ( top_region_index_tensor is not None) and (bottom_region_index_tensor is not None)
 
-    # use binary encoding to encode segmentation mask
-    controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+    # Concatenate pre-contrast MRI and tumor mask to create 2-channel ControlNet condition
+    # pre_tensor: [B, 1, H, W, D], labels: [B, 1, H, W, D] -> controlnet_cond: [B, 2, H, W, D]
+    pre_for_concat = pre_tensor.as_tensor() if hasattr(pre_tensor, 'as_tensor') else pre_tensor
+    label_for_concat = labels.as_tensor() if hasattr(labels, 'as_tensor') else labels
+    controlnet_cond = torch.cat([pre_for_concat, label_for_concat.to(torch.float32)], dim=1)
 
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
@@ -322,7 +327,7 @@ def train_controlnet(
     else:
         args.modality_mapping = None
 
-    train_loader, _ = prepare_maisi_controlnet_json_dataloader(
+    train_loader, val_loader = prepare_maisi_controlnet_json_dataloader(
         json_data_list=args.json_data_list,
         data_base_dir=args.data_base_dir,
         rank=rank,
@@ -360,8 +365,11 @@ def train_controlnet(
             # get image embedding and label mask and scale image embedding by the provided scale_factor
             images = batch["image"].to(device) * scale_factor
             labels = batch["label"].to(device)
+            pre_tensor = batch["pre"].to(device)
             if labels.shape[1] != 1:
                 raise ValueError(f"We expect labels with shape [B,1,X,Y,Z], yet got {labels.shape}")
+            if pre_tensor.shape[1] != 1:
+                raise ValueError(f"We expect pre_tensor with shape [B,1,X,Y,Z], yet got {pre_tensor.shape}")
             # get corresponding conditions
             spacing_tensor = batch["spacing"].to(device)
             top_region_index_tensor = None
@@ -395,7 +403,7 @@ def train_controlnet(
                     model_block1_output, 
                     model_block2_output
                 ) = compute_model_output(
-                    images,labels,noise,timesteps,noise_scheduler,
+                    images,labels,pre_tensor,noise,timesteps,noise_scheduler,
                     controlnet,unet,
                     spacing_tensor,
                     modality_tensor,
@@ -409,7 +417,7 @@ def train_controlnet(
                         model_block1_output_roi_free,
                         model_block2_output_roi_free,
                     ) = compute_model_output(
-                        images,labels_roi_free,noise,timesteps,noise_scheduler,
+                        images,labels_roi_free,pre_tensor,noise,timesteps,noise_scheduler,
                         controlnet,unet,
                         spacing_tensor,
                         modality_tensor,
@@ -437,7 +445,7 @@ def train_controlnet(
                 if weighted_loss > 1.0:
                     weights = torch.ones_like(images).to(images.device)
                     roi = torch.zeros([noise_shape[0]] + [1] + noise_shape[2:]).to(images.device)
-                    interpolate_label = F.interpolate(labels, size=images.shape[2:], mode="nearest")
+                    interpolate_label = F.interpolate(labels.float(), size=images.shape[2:], mode="nearest")
                     # assign larger weights for ROI (tumor)
                     for label in weighted_loss_label:
                         roi[interpolate_label == label] = 1
@@ -492,26 +500,110 @@ def train_controlnet(
 
         epoch_loss = epoch_loss_ / (step + 1)
 
+        # Validation
+        val_loss_ = 0
+        if val_loader is not None:
+            controlnet.eval()
+            with torch.no_grad():
+                for val_step, val_batch in enumerate(val_loader):
+                    val_images = val_batch["image"].to(device) * scale_factor
+                    val_labels = val_batch["label"].to(device)
+                    val_pre_tensor = val_batch["pre"].to(device)
+
+                    val_spacing_tensor = val_batch["spacing"].to(device)
+                    val_modality_tensor = None
+                    if include_modality:
+                        val_modality_tensor = val_batch["modality"].to(device)
+
+                    val_top_region_index_tensor = None
+                    val_bottom_region_index_tensor = None
+                    if include_body_region:
+                        val_top_region_index_tensor = val_batch["top_region_index"].to(device)
+                        val_bottom_region_index_tensor = val_batch["bottom_region_index"].to(device)
+
+                    with autocast("cuda", enabled=True):
+                        val_noise = torch.randn(val_images.shape, dtype=val_images.dtype).to(device)
+                        if isinstance(noise_scheduler, RFlowScheduler):
+                            val_timesteps = noise_scheduler.sample_timesteps(val_images)
+                        else:
+                            val_timesteps = torch.randint(
+                                0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device
+                            ).long()
+
+                        val_model_output, _, _ = compute_model_output(
+                            val_images, val_labels, val_pre_tensor, val_noise, val_timesteps, noise_scheduler,
+                            controlnet, unet,
+                            val_spacing_tensor,
+                            val_modality_tensor,
+                            val_top_region_index_tensor,
+                            val_bottom_region_index_tensor,
+                            return_controlnet_blocks=False
+                        )
+
+                        if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                            val_model_gt = val_noise
+                        elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                            val_model_gt = val_images
+                        elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
+                            val_model_gt = val_images - val_noise
+                        else:
+                            val_model_gt = val_noise
+
+                        if weighted_loss > 1.0:
+                            val_weights = torch.ones_like(val_images).to(val_images.device)
+                            val_roi = torch.zeros([val_images.shape[0]] + [1] + list(val_images.shape[2:])).to(val_images.device)
+                            val_interpolate_label = F.interpolate(val_labels.float(), size=val_images.shape[2:], mode="nearest")
+                            for label in weighted_loss_label:
+                                val_roi[val_interpolate_label == label] = 1
+                            val_weights[val_roi.repeat(1, val_images.shape[1], 1, 1, 1) == 1] = weighted_loss
+                            val_loss = (F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none") * val_weights).mean()
+                        else:
+                            val_loss = F.l1_loss(val_model_output.float(), val_model_gt.float())
+
+                    val_loss_ += val_loss.detach()
+
+            val_loss = val_loss_ / (val_step + 1)
+            if use_ddp:
+                dist.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG)
+            controlnet.train()
+
         if use_ddp:
             dist.barrier()
             dist.all_reduce(epoch_loss, op=torch.distributed.ReduceOp.AVG)
 
         if rank == 0:
+            # Log train and val loss
+            if val_loader is not None:
+                tensorboard_writer.add_scalar("val/val_controlnet_loss_epoch", val_loss.cpu().item(), total_step)
+                logger.info(f"[Epoch {epoch + 1}/{n_epochs}] Train Loss: {epoch_loss.cpu().item():.4f}, Val Loss: {val_loss.cpu().item():.4f}")
+            else:
+                logger.info(f"[Epoch {epoch + 1}/{n_epochs}] Train Loss: {epoch_loss.cpu().item():.4f}")
             tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
+
             # save controlnet only on master GPU (rank 0)
             controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
+
+            # Save every epoch
+            epoch_model_path = f"{args.model_dir}/{args.exp_name}_epoch_{epoch + 1}.pt"
             torch.save(
                 {
                     "epoch": epoch + 1,
                     "loss": epoch_loss,
+                    "val_loss": val_loss.cpu().item() if val_loader is not None else None,
                     "controlnet_state_dict": controlnet_state_dict,
                 },
-                f"{args.model_dir}/{args.exp_name}_current.pt",
+                epoch_model_path,
             )
-            logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_current.pt")
+            logger.info(f"Save trained model to {epoch_model_path}")
 
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
+            # Save best model based on val loss
+            if val_loader is not None:
+                current_loss = val_loss
+            else:
+                current_loss = epoch_loss
+
+            if current_loss < best_loss:
+                best_loss = current_loss
                 logger.info(f"best loss -> {best_loss}.")
                 torch.save(
                     {
@@ -521,7 +613,7 @@ def train_controlnet(
                     },
                     f"{args.model_dir}/{args.exp_name}_best.pt",
                 )
-                logger.info(f"Save trained model to {args.model_dir}/{args.exp_name}_best.pt")
+                logger.info(f"Save best model to {args.model_dir}/{args.exp_name}_best.pt")
 
         torch.cuda.empty_cache()
     if use_ddp:
