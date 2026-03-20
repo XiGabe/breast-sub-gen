@@ -35,25 +35,8 @@ from .diff_model_setting import initialize_distributed, load_config, setup_loggi
 from .augmentation import remove_tumors
 
 def remove_roi(labels):
-    """
-    Remove ROI voxels from a label tensor. 
-    Users need to define their own function of remove_roi.
-    Here we use scripts.augmentation.remove_tumors as default
-
-    Args:
-        labels (torch.Tensor): Segmentation tensor. Shape is
-            [B, 1, X, Y, Z]. Dtype is usually integer/long.
-
-    Returns:
-        torch.Tensor: Labels with ROI content removed. Same shape and
-        device as `labels`.
-    """
-    labels_roi_free = []
-    for b in range(labels.shape[0]):
-        labels_roi_free_b = remove_tumors(labels[b,...])
-        labels_roi_free.append(labels_roi_free_b)
-    labels_roi_free = torch.cat(labels_roi_free,dim=0)
-    return labels_roi_free
+    # 抹掉 ROI 就是把病灶 Mask 全变回 0（背景）
+    return torch.zeros_like(labels)
     
 def compute_region_contrasive_loss(
     model_output,model_output_roi_free,model_gt,
@@ -360,6 +343,17 @@ def train_controlnet(
     unet.eval()
     prev_time = time.time()
     for epoch in range(n_epochs):
+        # 两阶段对比损失权重调度
+        # 前50个epoch: 强力点亮阶段 (weight=0.01) - 让模型学会"看到Mask就生成信号"
+        # 后50个epoch: 结构修复阶段 (weight=0.001) - 保持病灶的同时修复乳腺轮廓
+        if args.use_region_contrasive_loss:
+            if epoch < 50:
+                current_contrast_weight = 0.01
+            else:
+                current_contrast_weight = 0.001
+            if rank == 0:
+                logger.info(f"[Epoch {epoch+1}] Contrastive loss weight: {current_contrast_weight}")
+
         epoch_loss_ = 0
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -467,7 +461,7 @@ def train_controlnet(
                     final_loss_region_contrasive = loss_region_contrasive + loss_region_bg
                     logger.info(f"loss_region_contrasive: {loss_region_contrasive}")
                     logger.info(f"loss_region_bg: {loss_region_bg}")
-                    loss += args.controlnet_train["region_contrasive_loss_weight"]*final_loss_region_contrasive
+                    loss += current_contrast_weight * final_loss_region_contrasive
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

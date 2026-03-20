@@ -1,12 +1,14 @@
 {
     "controlnet_train": {
-        "batch_size": 12,
+        "batch_size": 8,
         "cache_rate": 0.0,
         "fold": 0,
         "lr": 5e-5,
         "n_epochs": 100,
         "weighted_loss_label": [1],
-        "weighted_loss": 100
+        "weighted_loss": 100,
+        "use_region_contrasive_loss": true,
+        "region_contrasive_loss_delta": 2
     },
     "controlnet_infer": {
        "num_inference_steps": 30,
