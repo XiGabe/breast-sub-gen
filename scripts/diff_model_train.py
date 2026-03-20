@@ -66,20 +66,23 @@ def augment_modality_label(modality_tensor, prob=0.1):
 
 
 
-def load_filenames(data_list_path: str) -> list:
+def load_filenames(data_list_path: str, split: str = "training") -> list:
     """
     Load filenames from the JSON data list.
 
     Args:
         data_list_path (str): Path to the JSON data list file.
+        split (str): Which split to load - "training" or "validation".
 
     Returns:
         list: List of filenames.
     """
     with open(data_list_path, "r") as file:
         json_data = json.load(file)
-    filenames_train = json_data["training"]
-    return [_item["image"].replace(".nii.gz", "_emb.nii.gz") for _item in filenames_train]
+    if split not in json_data:
+        return []
+    filenames = json_data[split]
+    return [_item["image"] for _item in filenames]
 
 
 def prepare_data(
@@ -107,34 +110,38 @@ def prepare_data(
         DataLoader: Data loader for training.
     """
 
-    def _load_data_from_file(file_path, key, convert_to_float = True):
-        with open(file_path) as f:
-            if convert_to_float:
-                return torch.FloatTensor(json.load(f)[key])
-            else:
-                return json.load(f)[key]
+    def _load_spacing(x):
+        """Load spacing from direct value or file path."""
+        if isinstance(x, list):
+            return torch.FloatTensor(x) * 1e2
+        elif isinstance(x, str):
+            with open(x) as f:
+                return torch.FloatTensor(json.load(f)["spacing"]) * 1e2
+        return x
+
+    def _load_modality(x, modality_mapping):
+        """Load modality from direct value or file path."""
+        if isinstance(x, str):
+            # Direct string value like "mri"
+            return modality_mapping.get(x, x)
+        elif isinstance(x, int):
+            return x
+        return modality_mapping.get(x, x)
 
     train_transforms_list = [
         monai.transforms.LoadImaged(keys=["image"]),
         monai.transforms.EnsureChannelFirstd(keys=["image"]),
-        monai.transforms.Lambdad(keys="spacing", func=lambda x: _load_data_from_file(x, "spacing")),
-        monai.transforms.Lambdad(keys="spacing", func=lambda x: x * 1e2),
+        monai.transforms.Lambdad(keys="spacing", func=lambda x: _load_spacing(x)),
     ]
     if include_body_region:
         train_transforms_list += [
-            monai.transforms.Lambdad(
-                keys="top_region_index", func=lambda x: _load_data_from_file(x, "top_region_index")
-            ),
-            monai.transforms.Lambdad(
-                keys="bottom_region_index", func=lambda x: _load_data_from_file(x, "bottom_region_index")
-            ),
-            monai.transforms.Lambdad(keys="top_region_index", func=lambda x: x * 1e2),
-            monai.transforms.Lambdad(keys="bottom_region_index", func=lambda x: x * 1e2),
+            monai.transforms.Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x) * 1e2 if isinstance(x, list) else x),
+            monai.transforms.Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x) * 1e2 if isinstance(x, list) else x),
         ]
     if include_modality:
-         train_transforms_list += [ 
+         train_transforms_list += [
              monai.transforms.Lambdad(
-                keys="modality", func=lambda x: modality_mapping[_load_data_from_file(x, "modality", False)]
+                keys="modality", func=lambda x: _load_modality(x, modality_mapping)
              ),
              monai.transforms.EnsureTyped(keys=['modality'], dtype=torch.long),
          ]
@@ -375,6 +382,109 @@ def train_one_epoch(
     return loss_torch
 
 
+def validate(
+    epoch: int,
+    unet: torch.nn.Module,
+    val_loader: DataLoader,
+    loss_pt: torch.nn.L1Loss,
+    scale_factor: torch.Tensor,
+    noise_scheduler: torch.nn.Module,
+    num_train_timesteps: int,
+    device: torch.device,
+    logger: logging.Logger,
+    local_rank: int,
+) -> torch.Tensor:
+    """
+    Validate the model on validation set.
+
+    Args:
+        epoch (int): Current epoch number.
+        unet (torch.nn.Module): UNet model.
+        val_loader (DataLoader): Data loader for validation.
+        loss_pt (torch.nn.L1Loss): Loss function.
+        scale_factor (torch.Tensor): Scaling factor.
+        noise_scheduler (torch.nn.Module): Noise scheduler.
+        num_train_timesteps (int): Number of training timesteps.
+        device (torch.device): Device to use for validation.
+        logger (logging.Logger): Logger for logging information.
+        local_rank (int): Local rank for distributed training.
+
+    Returns:
+        torch.Tensor: Validation loss.
+    """
+    include_body_region = unet.include_top_region_index_input
+    include_modality = unet.num_class_embeds is not None
+
+    _iter = 0
+    loss_torch = torch.zeros(2, dtype=torch.float, device=device)
+
+    unet.eval()
+    for val_data in val_loader:
+        _iter += 1
+        images = val_data["image"].to(device)
+        images = images * scale_factor
+
+        if include_body_region:
+            top_region_index_tensor = val_data["top_region_index"].to(device)
+            bottom_region_index_tensor = val_data["bottom_region_index"].to(device)
+        if include_modality:
+            modality_tensor = val_data["modality"].to(device)
+
+        spacing_tensor = val_data["spacing"].to(device)
+
+        with torch.no_grad():
+            noise = torch.randn_like(images)
+
+            if isinstance(noise_scheduler, RFlowScheduler):
+                timesteps = noise_scheduler.sample_timesteps(images)
+            else:
+                timesteps = torch.randint(0, num_train_timesteps, (images.shape[0],), device=images.device).long()
+
+            noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
+
+            unet_inputs = {
+                "x": noisy_latent,
+                "timesteps": timesteps,
+                "spacing_tensor": spacing_tensor,
+            }
+            if include_body_region:
+                unet_inputs.update(
+                    {
+                        "top_region_index_tensor": top_region_index_tensor,
+                        "bottom_region_index_tensor": bottom_region_index_tensor,
+                    }
+                )
+            if include_modality:
+                unet_inputs.update(
+                    {
+                        "class_labels": modality_tensor,
+                    }
+                )
+            model_output = unet(**unet_inputs)
+
+            if noise_scheduler.prediction_type == DDPMPredictionType.EPSILON:
+                model_gt = noise
+            elif noise_scheduler.prediction_type == DDPMPredictionType.SAMPLE:
+                model_gt = images
+            elif noise_scheduler.prediction_type == DDPMPredictionType.V_PREDICTION:
+                model_gt = images - noise
+            else:
+                raise ValueError(
+                    "noise scheduler prediction type has to be chosen from ",
+                    f"[{DDPMPredictionType.EPSILON},{DDPMPredictionType.SAMPLE},{DDPMPredictionType.V_PREDICTION}]",
+                )
+
+            loss = loss_pt(model_output.float(), model_gt.float())
+
+        loss_torch[0] += loss.item()
+        loss_torch[1] += 1.0
+
+    if dist.is_initialized():
+        dist.all_reduce(loss_torch, op=torch.distributed.ReduceOp.SUM)
+
+    return loss_torch
+
+
 def save_checkpoint(
     epoch: int,
     unet: torch.nn.Module,
@@ -383,6 +493,8 @@ def save_checkpoint(
     scale_factor: torch.Tensor,
     ckpt_folder: str,
     args: argparse.Namespace,
+    is_best: bool = False,
+    val_loss: float = None,
 ) -> None:
     """
     Save checkpoint.
@@ -395,18 +507,34 @@ def save_checkpoint(
         scale_factor (torch.Tensor): Scaling factor.
         ckpt_folder (str): Checkpoint folder path.
         args (argparse.Namespace): Configuration arguments.
+        is_best (bool): Whether this is the best model based on validation loss.
+        val_loss (float): Validation loss (if available).
     """
     unet_state_dict = unet.module.state_dict() if dist.is_initialized() else unet.state_dict()
+    save_dict = {
+        "epoch": epoch + 1,
+        "loss": loss_torch_epoch,
+        "num_train_timesteps": num_train_timesteps,
+        "scale_factor": scale_factor,
+        "unet_state_dict": unet_state_dict,
+    }
+    if val_loss is not None:
+        save_dict["val_loss"] = val_loss
+
+    # Save each epoch checkpoint with epoch number (e.g., epoch_001.pt)
+    epoch_filename = args.model_filename.replace(".pt", f"_epoch_{epoch + 1:03d}.pt")
     torch.save(
-        {
-            "epoch": epoch + 1,
-            "loss": loss_torch_epoch,
-            "num_train_timesteps": num_train_timesteps,
-            "scale_factor": scale_factor,
-            "unet_state_dict": unet_state_dict,
-        },
-        f"{ckpt_folder}/{args.model_filename}",
+        save_dict,
+        f"{ckpt_folder}/{epoch_filename}",
     )
+
+    # Save best model if validation loss improved
+    if is_best:
+        best_filename = args.model_filename.replace(".pt", "_best.pt")
+        torch.save(
+            save_dict,
+            f"{ckpt_folder}/{best_filename}",
+        )
 
 
 def diff_model_train(
@@ -448,28 +576,48 @@ def diff_model_train(
     else:
         args.modality_mapping = None
 
-    filenames_train = load_filenames(args.json_data_list)
+    # Load full dataset JSON to get metadata (spacing, modality)
+    with open(args.json_data_list, "r") as f:
+        dataset_json = json.load(f)
+
+    train_data_list = dataset_json.get("training", [])
+    val_data_list = dataset_json.get("validation", [])
+
     if local_rank == 0:
-        logger.info(f"num_files_train: {len(filenames_train)}")
+        logger.info(f"num_files_train: {len(train_data_list)}")
+        logger.info(f"num_files_val: {len(val_data_list)}")
 
     train_files = []
-    for _i in range(len(filenames_train)):
-        str_img = os.path.join(args.embedding_base_dir, filenames_train[_i])
+    for item in train_data_list:
+        str_img = os.path.join(args.embedding_base_dir, item["image"])
         if not os.path.exists(str_img):
             continue
 
-        str_info = os.path.join(args.embedding_base_dir, filenames_train[_i]) + ".json"
-        train_files_i = {"image": str_img, "spacing": str_info}
-        if include_body_region:
-            train_files_i["top_region_index"] = str_info
-            train_files_i["bottom_region_index"] = str_info
-        if include_modality:
-            train_files_i["modality"] = str_info
+        train_files_i = {
+            "image": str_img,
+            "spacing": item["spacing"],
+            "modality": item["modality"]
+        }
         train_files.append(train_files_i)
+
+    val_files = []
+    for item in val_data_list:
+        str_img = os.path.join(args.embedding_base_dir, item["image"])
+        if not os.path.exists(str_img):
+            continue
+
+        val_files_i = {
+            "image": str_img,
+            "spacing": item["spacing"],
+            "modality": item["modality"]
+        }
+        val_files.append(val_files_i)
+
     if dist.is_initialized():
         train_files = partition_dataset(
             data=train_files, shuffle=True, num_partitions=dist.get_world_size(), even_divisible=True
         )[local_rank]
+        # For validation, we don't need distributed partitioning for single GPU
 
     train_loader = prepare_data(
         train_files,
@@ -480,6 +628,19 @@ def diff_model_train(
         include_modality=include_modality,
         modality_mapping = args.modality_mapping
     )
+
+    # Create validation DataLoader (only on rank 0 for single GPU or for validation)
+    val_loader = None
+    if len(val_files) > 0:
+        val_loader = prepare_data(
+            val_files,
+            device,
+            args.diffusion_unet_train["cache_rate"],
+            batch_size=args.diffusion_unet_train["batch_size"],
+            include_body_region=include_body_region,
+            include_modality=include_modality,
+            modality_mapping=args.modality_mapping
+        )
 
     scale_factor = calculate_scale_factor(train_loader, device, logger)
     optimizer = create_optimizer(unet, args.diffusion_unet_train["lr"])
@@ -493,6 +654,10 @@ def diff_model_train(
 
     torch.set_float32_matmul_precision("highest")
     logger.info("torch.set_float32_matmul_precision -> highest.")
+
+    # Track best validation loss
+    best_val_loss = float("inf")
+    is_best = False
 
     for epoch in range(args.diffusion_unet_train["n_epochs"]):
         loss_torch = train_one_epoch(
@@ -514,19 +679,52 @@ def diff_model_train(
         )
 
         loss_torch = loss_torch.tolist()
+        train_loss = loss_torch[0] / loss_torch[1] if loss_torch[1] > 0 else 0
+
+        # Validation
+        val_loss = None
+        if val_loader is not None:
+            val_loss_torch = validate(
+                epoch,
+                unet,
+                val_loader,
+                loss_pt,
+                scale_factor,
+                noise_scheduler,
+                args.noise_scheduler["num_train_timesteps"],
+                device,
+                logger,
+                local_rank,
+            )
+            val_loss_torch = val_loss_torch.tolist()
+            val_loss = val_loss_torch[0] / val_loss_torch[1] if val_loss_torch[1] > 0 else 0
+
+            # Check if this is the best model
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                logger.info(f"epoch {epoch + 1} - New best model! val_loss: {val_loss:.4f}")
+
         if torch.cuda.device_count() == 1 or local_rank == 0:
-            loss_torch_epoch = loss_torch[0] / loss_torch[1]
-            logger.info(f"epoch {epoch + 1} average loss: {loss_torch_epoch:.4f}.")
+            log_msg = f"epoch {epoch + 1} train loss: {train_loss:.4f}"
+            if val_loss is not None:
+                log_msg += f", val loss: {val_loss:.4f}"
+            logger.info(log_msg)
 
             save_checkpoint(
                 epoch,
                 unet,
-                loss_torch_epoch,
+                train_loss,
                 args.noise_scheduler["num_train_timesteps"],
                 scale_factor,
                 args.model_dir,
                 args,
+                is_best=is_best,
+                val_loss=val_loss,
             )
+
+    if local_rank == 0:
+        logger.info(f"Training completed. Best validation loss: {best_val_loss:.4f}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -565,4 +763,4 @@ if __name__ == "__main__":
     parser.add_argument("--no_amp", dest="amp", action="store_false", help="Disable automatic mixed precision training")
 
     args = parser.parse_args()
-    diff_model_train(args.env_config, args.model_config, args.model_def, args.num_gpus, args.amp)
+    diff_model_train(args.env_config_path, args.model_config_path, args.model_def_path, args.num_gpus, args.amp)

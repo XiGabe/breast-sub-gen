@@ -1,0 +1,12 @@
+{
+    "data_base_dir": "./data",
+    "embedding_base_dir": "./data",
+    "json_data_list": "./data/dataset_breast_cached.json",
+    "model_dir": "./models",
+    "model_filename": "diff_unet_3d_rflow-mr_breast_best.pt",
+    "output_dir": "./output",
+    "output_prefix": "unet_3d_breast",
+    "trained_autoencoder_path": "./weights/autoencoder_v2.pt",
+    "existing_ckpt_filepath": "./weights/diff_unet_3d_rflow-mr.pt",
+    "modality_mapping_path": "./configs/modality_mapping.json"
+}

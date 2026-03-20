@@ -249,8 +249,11 @@ def save_image(
         logger (logging.Logger): Logger for logging information.
     """
     out_affine = np.eye(4)
-    for i in range(3):
-        out_affine[i, i] = out_spacing[i]
+    # Convert ZYX spacing to LPS (XYZ) coordinate system
+    # out_spacing is in [Z, Y, X] order, but NIfTI affine uses [X, Y, Z]
+    out_affine[0, 0] = out_spacing[2]  # X = Z
+    out_affine[1, 1] = out_spacing[1]  # Y = Y
+    out_affine[2, 2] = out_spacing[0]  # Z = X
 
     new_image = nib.Nifti1Image(data, affine=out_affine)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
