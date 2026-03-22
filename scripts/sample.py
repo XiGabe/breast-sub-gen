@@ -192,10 +192,11 @@ def ldm_conditional_sample_one_image(
     scale_factor,
     device,
     combine_label_or,
-    spacing_tensor,
-    latent_shape,
-    output_size,
-    noise_factor,
+    pre_tensor=None,
+    spacing_tensor=None,
+    latent_shape=None,
+    output_size=None,
+    noise_factor=1.0,
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
     modality_tensor=None,
@@ -230,7 +231,9 @@ def ldm_conditional_sample_one_image(
     Returns:
         tuple: A tuple containing the synthetic image and its corresponding label.
     """
-    if modality_tensor<=7:
+    # Get modality value for intensity range determination
+    modality_val = modality_tensor[0].item() if modality_tensor is not None else 8
+    if modality_val <= 7:
         # CT image intensity range
         a_min = -1000
         a_max = 1000
@@ -265,7 +268,15 @@ def ldm_conditional_sample_one_image(
             )
             combine_label = torch.nn.functional.interpolate(combine_label, size=output_size, mode="nearest")
 
-        controlnet_cond_vis = binarize_labels(combine_label.as_tensor().long()).half()
+        # Create ControlNet condition: concat pre-contrast MRI + tumor mask (2-channel)
+        if pre_tensor is not None:
+            # Training logic: use pre + label as ControlNet condition
+            pre_for_concat = pre_tensor.as_tensor() if hasattr(pre_tensor, 'as_tensor') else pre_tensor
+            label_for_concat = combine_label.as_tensor() if hasattr(combine_label, 'as_tensor') else combine_label
+            controlnet_cond_vis = torch.cat([pre_for_concat, label_for_concat.to(torch.float32)], dim=1)
+        else:
+            # Fallback: use only label (original logic for backward compatibility)
+            controlnet_cond_vis = binarize_labels(combine_label.as_tensor().long()).half()
 
         # Generate random noise
         latents = initialize_noise_latents(latent_shape, device) * noise_factor
@@ -297,9 +308,15 @@ def ldm_conditional_sample_one_image(
             total=min(len(all_timesteps), len(all_next_timesteps)),
         )
         if cfg_guidance_scale > 0:
-            combine_label_no_tumor = torch.nn.functional.interpolate(remove_tumors(combine_label.squeeze(0)).unsqueeze(0).float(), size=output_size, mode="nearest").to(combine_label.dtype)
-            controlnet_cond_vis_no_tumor = binarize_labels(combine_label_no_tumor.as_tensor().long()).half()
-            del combine_label_no_tumor
+            if pre_tensor is not None:
+                # For pre+label case: create no-tumor condition by using pre + zeros
+                pre_for_concat_no_tumor = pre_tensor.as_tensor() if hasattr(pre_tensor, 'as_tensor') else pre_tensor
+                label_no_tumor = torch.zeros_like(combine_label.as_tensor() if hasattr(combine_label, 'as_tensor') else combine_label)
+                controlnet_cond_vis_no_tumor = torch.cat([pre_for_concat_no_tumor, label_no_tumor.to(torch.float32)], dim=1)
+            else:
+                combine_label_no_tumor = torch.nn.functional.interpolate(remove_tumors(combine_label.squeeze(0)).unsqueeze(0).float(), size=output_size, mode="nearest").to(combine_label.dtype)
+                controlnet_cond_vis_no_tumor = binarize_labels(combine_label_no_tumor.as_tensor().long()).half()
+                del combine_label_no_tumor
         for t, next_t in progress_bar:
             # get controlnet output
             # Create a dictionary to store the inputs

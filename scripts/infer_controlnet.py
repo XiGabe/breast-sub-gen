@@ -92,13 +92,13 @@ def infer_controlnet(
     else:
         args.modality_mapping = None
 
-    # Step 1: set data loader
+    # Step 1: set data loader (use batch_size=1 for inference)
     _, val_loader = prepare_maisi_controlnet_json_dataloader(
         json_data_list=args.json_data_list,
         data_base_dir=args.data_base_dir,
         rank=rank,
         world_size=world_size,
-        batch_size=args.controlnet_train["batch_size"],
+        batch_size=1,
         cache_rate=args.controlnet_train["cache_rate"],
         fold=args.controlnet_train["fold"],
         modality_mapping=args.modality_mapping
@@ -112,6 +112,8 @@ def infer_controlnet(
     for batch in val_loader:
         # get label mask
         labels = batch["label"].to(device)
+        # get pre-contrast MRI for ControlNet conditioning
+        pre_tensor = batch["pre"].to(device)
         # get corresponding conditions
         if include_body_region:
             top_region_index_tensor = batch["top_region_index"].to(device)
@@ -122,9 +124,8 @@ def infer_controlnet(
         spacing_tensor = batch["spacing"].to(device)
         modality_tensor = args.controlnet_infer["modality"] * torch.ones((len(labels),), dtype=torch.long).to(device)
         out_spacing = tuple((batch["spacing"].squeeze().numpy() / 100).tolist())
-        # get target dimension
-        dim = batch["dim"]
-        output_size = (dim[0].item(), dim[1].item(), dim[2].item())
+        # get target dimension from label shape
+        output_size = (labels.shape[2], labels.shape[3], labels.shape[4])
         latent_shape = (args.latent_channels, output_size[0] // 4, output_size[1] // 4, output_size[2] // 4)
 
         # generate a single synthetic image using a latent diffusion model with controlnet.
@@ -136,6 +137,7 @@ def infer_controlnet(
             scale_factor=scale_factor,
             device=device,
             combine_label_or=labels,
+            pre_tensor=pre_tensor,
             top_region_index_tensor=top_region_index_tensor,
             bottom_region_index_tensor=bottom_region_index_tensor,
             spacing_tensor=spacing_tensor,
