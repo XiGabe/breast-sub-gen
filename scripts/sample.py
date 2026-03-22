@@ -410,20 +410,19 @@ def ldm_conditional_sample_one_image(
             device=torch.device("cpu"),
         )
         synthetic_images = dynamic_infer(inferer, recon_model, latents)
-        if modality_tensor<=7:
-            synthetic_images = torch.clip(synthetic_images, b_min, b_max).cpu()
-        else:
-            synthetic_images = torch.clip(synthetic_images, b_min, None).cpu()
+        synthetic_images = torch.clip(synthetic_images, b_min, b_max).cpu()
         end_time = time.time()
         logging.info(f"---- Image VAE decoding time: {end_time - start_time} seconds ----")
 
         ## post processing:
         # project output to [0, 1]
         synthetic_images = (synthetic_images - b_min) / (b_max - b_min)
+        # [COMMENTED] to output [0, 1] instead of [0, 1000]
         # project output to [-1000, 1000]
-        synthetic_images = synthetic_images * (a_max - a_min) + a_min
+        # synthetic_images = synthetic_images * (a_max - a_min) + a_min
         # regularize background intensities
-        synthetic_images = crop_img_body_mask(synthetic_images, combine_label, a_min=a_min)
+        # [COMMENTED] to show full subtraction map including background breast tissue
+        # synthetic_images = crop_img_body_mask(synthetic_images, combine_label, a_min=a_min)
         torch.cuda.empty_cache()
 
     return synthetic_images, combine_label
