@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
 
 import torch
 import torch.distributed as dist
@@ -150,19 +149,34 @@ def infer_controlnet(
             autoencoder_sliding_window_infer_overlap=args.controlnet_infer["autoencoder_sliding_window_infer_overlap"],
         )
         # save image/label pairs
-        labels = decollate_batch(batch)[0]["label"]
-        output_postfix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        labels.meta["filename_or_obj"] = "sample.nii.gz"
+        batch_decollated = decollate_batch(batch)[0]
+        labels = batch_decollated["label"]
+
+        # Get original filename from metadata for naming output
+        original_filename = batch_decollated["label"].meta.get("filename_or_obj", "sample")
+        if isinstance(original_filename, str):
+            # Extract basename without extension
+            base_name = os.path.splitext(os.path.basename(original_filename))[0]
+            # Remove _mask_aligned suffix to get base name like DUKE_001_L
+            data_name = base_name.replace("_mask_aligned", "")
+        else:
+            data_name = "sample"
+
+        # Update metadata so SaveImage uses our custom naming (no extension)
+        labels.meta["filename_or_obj"] = data_name
+
         synthetic_images = MetaTensor(synthetic_images.squeeze(0), meta=labels.meta)
+        synthetic_images.meta["filename_or_obj"] = data_name
+
         img_saver = SaveImage(
             output_dir=args.output_dir,
-            output_postfix=output_postfix + "_image",
+            output_postfix="sub",
             separate_folder=False,
         )
         img_saver(synthetic_images)
         label_saver = SaveImage(
             output_dir=args.output_dir,
-            output_postfix=output_postfix + "_label",
+            output_postfix="mask",
             separate_folder=False,
         )
         label_saver(labels)
