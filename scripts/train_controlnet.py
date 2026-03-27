@@ -36,23 +36,17 @@ from .augmentation import remove_tumors
 
 def remove_roi(labels):
     """
-    Remove ROI voxels from a label tensor. 
-    Users need to define their own function of remove_roi.
-    Here we use scripts.augmentation.remove_tumors as default
+    Remove ROI voxels from a label tensor.
+    For breast data: 0=bg, 1=tumor. This function sets tumor to 0 (bg).
 
     Args:
-        labels (torch.Tensor): Segmentation tensor. Shape is
-            [B, 1, X, Y, Z]. Dtype is usually integer/long.
+        labels (torch.Tensor): Segmentation tensor. Shape is [B, 1, X, Y, Z].
 
     Returns:
-        torch.Tensor: Labels with ROI content removed. Same shape and
-        device as `labels`.
+        torch.Tensor: Labels with ROI content removed (tumor->bg=0).
     """
-    labels_roi_free = []
-    for b in range(labels.shape[0]):
-        labels_roi_free_b = remove_tumors(labels[b,...])
-        labels_roi_free.append(labels_roi_free_b)
-    labels_roi_free = torch.cat(labels_roi_free,dim=0)
+    labels_roi_free = labels.clone()
+    labels_roi_free[labels == 1] = 0  # Set tumor to background
     return labels_roi_free
     
 def compute_region_contrasive_loss(
@@ -251,10 +245,12 @@ def train_controlnet(
         args.use_region_contrasive_loss = False
     else:
         args.use_region_contrasive_loss = args.controlnet_train["use_region_contrasive_loss"]
-        for k in ["region_contrasive_loss_delta", "region_contrasive_loss_weight"]:
-            if k not in args.controlnet_train.keys():
-                raise ValueError(f"Since 'use_region_contrasive_loss' is in 'controlnet_train' of {model_config_path}, we need 'region_contrasive_loss_delta' and 'region_contrasive_loss_weight' also be in it.")
-    
+        if "region_contrasive_loss_delta" not in args.controlnet_train.keys():
+            raise ValueError(f"Since 'use_region_contrasive_loss' is in 'controlnet_train' of {model_config_path}, we need 'region_contrasive_loss_delta' also be in it.")
+        # Add defaults for stage1/stage2 contrastive weights
+        args.controlnet_train.setdefault("contrastive_weight_stage1", 0.01)
+        args.controlnet_train.setdefault("contrastive_weight_stage2", 0.001)
+
     logger.info(f"use_region_contrasive_loss: {args.use_region_contrasive_loss}")
     if args.use_region_contrasive_loss:
         logger.warning(f"User sets 'use_region_contrasive_loss' as true in {model_config_path}.")
@@ -360,6 +356,11 @@ def train_controlnet(
     unet.eval()
     prev_time = time.time()
     for epoch in range(n_epochs):
+        if epoch < n_epochs / 2:
+            current_contrastive_weight = args.controlnet_train["contrastive_weight_stage1"]
+        else:
+            current_contrastive_weight = args.controlnet_train["contrastive_weight_stage2"]
+        logger.info(f"[Epoch {epoch+1}] Using contrastive_weight: {current_contrastive_weight}")
         epoch_loss_ = 0
         for step, batch in enumerate(train_loader):
             # get image embedding and label mask and scale image embedding by the provided scale_factor
@@ -467,7 +468,9 @@ def train_controlnet(
                     final_loss_region_contrasive = loss_region_contrasive + loss_region_bg
                     logger.info(f"loss_region_contrasive: {loss_region_contrasive}")
                     logger.info(f"loss_region_bg: {loss_region_bg}")
-                    loss += args.controlnet_train["region_contrasive_loss_weight"]*final_loss_region_contrasive
+                    tensorboard_writer.add_scalar("train/loss_region_contrasive", loss_region_contrasive.detach().cpu().item(), total_step)
+                    tensorboard_writer.add_scalar("train/loss_region_bg", loss_region_bg.detach().cpu().item(), total_step)
+                    loss += current_contrastive_weight * final_loss_region_contrasive
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
