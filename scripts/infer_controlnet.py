@@ -30,7 +30,7 @@ from .diff_model_setting import load_config
 
 @torch.inference_mode()
 def infer_controlnet(
-    env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int
+    env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int, num_samples: int = None
 ) -> None:
 
     # Step 0: configuration
@@ -108,7 +108,11 @@ def infer_controlnet(
     controlnet.eval()
     unet.eval()
 
+    sample_count = 0
     for batch in val_loader:
+        if num_samples is not None and sample_count >= num_samples:
+            break
+        sample_count += 1
         # get label mask
         labels = batch["label"].to(device)
         # get pre-contrast MRI for ControlNet conditioning
@@ -203,11 +207,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-g",
-        "--num_gpus", 
-        type=int, 
-        default=1, 
+        "--num_gpus",
+        type=int,
+        default=1,
         help="Number of GPUs to use for training"
+    )
+    parser.add_argument(
+        "-n",
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to inference (default: all)"
     )
 
     args = parser.parse_args()
-    infer_controlnet(args.env_config_path, args.model_config_path, args.model_def_path, args.num_gpus)
+    infer_controlnet(args.env_config_path, args.model_config_path, args.model_def_path, args.num_gpus, args.num_samples)
