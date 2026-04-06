@@ -6,79 +6,78 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a breast MRI subtraction imaging project using diffusion models (MAISI DiT). The goal is to train a DiT model to generate sparse lesion masks (black background + highlighted lesions) from breast MRI subtraction data.
 
-## Common Commands
-
-### Training (Breast Sparse Training)
-
-```bash
-# Submit training job via sbatch
-cd /midtier/sablab/scratch/hoc4008/breast-sub-gen
-sbatch scripts/train_breast_sparse.sh
-
-# Monitor training logs
-tail -f logs/train_<job_id>.err
-```
-
-### Training
-
-```bash
-conda activate breast_gen
-python -m scripts.diff_model_train \
-  -e configs/environment_maisi_diff_model_rflow-mr_breast.json \
-  -c configs/config_maisi_diff_model_rflow-mr_breast.json \
-  -t configs/config_network_rflow.json \
-  -g 1
-```
-
-### Inference
-```bash
-source /home/hoc4008/miniconda3/etc/profile.d/conda.sh && conda activate breast_gen && python -m scripts.diff_model_infer -e configs/environment_maisi_diff_model_rflow-mr_breast.json -c configs/config_maisi_diff_model_rflow-mr_breast.json -t configs/config_network_rflow.json -g 1 2>&1
-```
-
 ## Architecture
 
-### Key Scripts
+### Model Pipeline
 
-- `scripts/diff_model_train.py` - Main training script for DiT model (modified for breast data with validation loss)
-- `scripts/diff_model_infer.py` - Inference script
-- `scripts/sample.py` - Sampling/generation script
-- `scripts/diff_model_setting.py` - Configuration utilities (load_config, setup_logging, initialize_distributed)
-- `scripts/train_controlnet.py` - ControlNet training
-- `scripts/inference.py` - General inference
+The codebase implements a **Latent Diffusion Model (LDM)** pipeline based on MONAI:
 
-### Configuration Files
+1. **Autoencoder (VAE)** - `scripts/sample.py:ReconModel`
+   - Encodes images into latent space via `autoencoder.encode_stage_1_inputs()`
+   - Decodes latents back to image space via `autoencoder.decode_stage_2_outputs()`
+   - Scale factor normalizes latent magnitudes
 
-- `configs/config_maisi_diff_model_rflow-mr_breast.json` - Model config (batch_size=8, n_epochs=500)
-- `configs/environment_maisi_diff_model_rflow-mr_breast.json` - Environment paths (data, weights, output)
-- `configs/config_network_rflow.json` - Network architecture definition
-- `configs/modality_mapping.json` - Modality mapping (MRI=9)
+2. **Diffusion UNet** - `scripts/diff_model_train.py`, `scripts/sample.py:ldm_conditional_sample_one_mask`
+   - Operates in latent space (not pixel space)
+   - Uses RFlowScheduler for continuous-time flow matching
+   - Takes noisy latent + condition (modality, spacing, body region) as input
+   - Outputs noise prediction for denoising
 
-### Data
+3. **ControlNet** - `scripts/train_controlnet.py`, `scripts/infer_controlnet.py`
+   - Provides additional conditioning (body region index, modality embeddings)
+   - Two losses: `compute_region_contrasive_loss` (ROI contrastive) + background similarity loss
 
-- **Embeddings**: `data/embeddings_breast_sub/` (1943 latent embeddings)
-- **Masks**: `data/processed_mask/`
-- **Dataset JSON**: `data/dataset_breast_cached.json` (training: 1553, validation: 390)
+### Data Flow
 
-### Checkpoints
+```
+Raw Image → Autoencoder.encode → Latent z
+                                   ↓
+                          [Diffusion Process]
+                                   ↓
+                          Autoencoder.decode → Generated Image
+```
 
-- **Pretrained**: `weights/diff_unet_3d_rflow-mr.pt` (2.1GB)
-- **Output**: `models/diff_unet_3d_rflow-mr_breast_epoch_*.pt`
+For training (`diff_model_train.py`):
+- Forward: noise ε added to latent z → UNet predicts ε
+- Loss: L1 between predicted and true noise
+- Validation: same loss on held-out data
 
-## Training Details
+For inference (`sample.py:ldm_conditional_sample_one_mask`):
+- Start from random noise latent
+- Iteratively denoise using RFlowScheduler
+- Decode final latent to image
 
-- **Loss**: Plain L1 Loss
-- **Batch size**: 16
-- **Epochs**: 500
-- **Learning rate**: 1e-5
-- **Spacing**: [1.2, 0.7, 0.7] (Z, Y, X)
-- **Modality**: MRI (8)
-- **Validation**: 390 samples (10% of data)
+### Scripts Overview
 
-## Key Modifications Made
+| Script | Purpose |
+|--------|---------|
+| `diff_model_setting.py` | Config loading (`load_config`), DDP setup, logging |
+| `diff_model_train.py` | DiT training loop, validation, checkpointing |
+| `diff_model_infer.py` | DiT inference with sliding window |
+| `sample.py` | Core sampling classes: `ReconModel`, `LDMSampler`, `ldm_conditional_sample_one_*` |
+| `train_controlnet.py` | ControlNet training with region contrastive loss |
+| `infer_controlnet.py` | ControlNet-based conditional generation |
+| `inference.py` | MAISI general inference (downloads model, runs inference) |
+| `utils.py` | `define_instance` (JSON→class), `dynamic_infer`, label remapping |
+| `augmentation.py` | 3D elastic/affine transforms, tumor removal |
+| `find_masks.py` | Mask candidate search by body region/anatomy |
+| `transforms.py` | CT/MRI intensity normalization transforms |
+| `quality_check.py` | Outlier detection for generated samples |
+| `utils_plot.py` | Visualization utilities (3D plots, center finding) |
 
-The training script was modified to:
-1. Support loading validation data from `dataset_breast_cached.json`
-2. Calculate validation loss after each epoch
-3. Save best model based on validation loss
-4. Save each epoch checkpoint with epoch number
-5. Read spacing/modality directly from dataset JSON (not separate JSON files)
+### Configuration System
+
+Three JSON files compose a full config:
+- **Environment** (`environment_*.json`): data paths, checkpoint paths, output directories
+- **Model** (`config_*.json`): batch_size, epochs, learning rate, scheduler params
+- **Network** (`config_network_*.json`): UNet architecture definition (via `define_instance`)
+
+`modality_mapping.json` maps imaging modalities to integer IDs (MRI=9, CT=2/3).
+
+### Key Classes
+
+- `RFlowScheduler` (MONAI) - continuous-time diffusion scheduler
+- `ReconModel` - wraps autoencoder for decoding
+- `LDMSampler` / `lddm_conditional_sample_one_*` - sampling with/without conditions
+- `DiffusionInferer` / `SlidingWindowInferer` - MONAI inference helpers
+- `define_instance(args, name)` - instantiates class from JSON config by name
