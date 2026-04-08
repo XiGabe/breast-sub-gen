@@ -10,6 +10,7 @@
 *.out
 data/dataset_breast_cached.json
 data/dataset_breast.json
+nnUNet_train
 .claude/.nfs0000000020086334000057de
 \[2026.03.24] old_architecture/data/dataset_breast_cached.json
 *.txt
