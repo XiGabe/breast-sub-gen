@@ -23,10 +23,8 @@ export nnUNet_results="./nnUNet_train/training_results"
 # - num_gpus: number of GPUs to use
 # - npz: save COMPOSITE (loss and dice) as npz files for later analysis
 # - tr: use nnUNetTrainer_250epochs (250 epochs)
-echo "Starting fold 3 training..."
-nnUNetv2_train 800 3d_fullres 3 -num_gpus 1 --npz -tr nnUNetTrainer_250epochs
-
-echo "Fold 3 completed, starting fold 4..."
+echo "Starting fold 4 training..."
 nnUNetv2_train 800 3d_fullres 4 -num_gpus 1 --npz -tr nnUNetTrainer_250epochs
 
 echo "Training completed"
+    
