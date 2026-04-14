@@ -1,16 +1,17 @@
 {
     "controlnet_train": {
-        "batch_size": 4,
+        "batch_size": 8,
         "cache_rate": 0.0,
         "fold": 0,
-        "lr": 5e-5,
-        "n_epochs": 200,
+        "lr": 1e-6,
+        "n_epochs": 250,
         "weighted_loss_label": [1],
         "weighted_loss": 1,
-        "use_region_contrasive_loss": true,
+        "use_region_contrasive_loss": false,
         "region_contrasive_loss_delta": 0.35,
-        "contrastive_weight_stage1": 0.01,
-        "contrastive_weight_stage2": 0.001
+        "use_mixed_mask_source": true,
+        "gt_softening_sigma": 0.5,
+        "mixed_mask_ratio": 0.7
     },
     "controlnet_infer": {
        "num_inference_steps": 30,

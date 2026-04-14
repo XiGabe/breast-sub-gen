@@ -30,7 +30,7 @@ from .diff_model_setting import load_config
 
 @torch.inference_mode()
 def infer_controlnet(
-    env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int, num_samples: int = None
+    env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int, num_samples: int = None, use_pred_label: bool = False
 ) -> None:
 
     # Step 0: configuration
@@ -113,8 +113,11 @@ def infer_controlnet(
         if num_samples is not None and sample_count >= num_samples:
             break
         sample_count += 1
-        # get label mask
-        labels = batch["label"].to(device)
+        # get label mask (use pred_label if specified)
+        if use_pred_label:
+            labels = batch["pred_label"].to(device)
+        else:
+            labels = batch["label"].to(device)
         # get pre-contrast MRI for ControlNet conditioning
         pre_tensor = batch["pre"].to(device)
         # get corresponding conditions
@@ -154,10 +157,12 @@ def infer_controlnet(
         )
         # save image/label pairs
         batch_decollated = decollate_batch(batch)[0]
-        labels = batch_decollated["label"]
-
-        # Get original filename from metadata for naming output
-        original_filename = batch_decollated["label"].meta.get("filename_or_obj", "sample")
+        if use_pred_label:
+            labels = batch_decollated["pred_label"]
+            original_filename = batch_decollated["pred_label"].meta.get("filename_or_obj", "sample")
+        else:
+            labels = batch_decollated["label"]
+            original_filename = batch_decollated["label"].meta.get("filename_or_obj", "sample")
         if isinstance(original_filename, str):
             # Extract basename without extension
             base_name = os.path.splitext(os.path.basename(original_filename))[0]
@@ -219,6 +224,11 @@ if __name__ == "__main__":
         default=None,
         help="Number of samples to inference (default: all)"
     )
+    parser.add_argument(
+        "--use_pred_label",
+        action="store_true",
+        help="Use pred_label (nnUNet output) instead of label for inference"
+    )
 
     args = parser.parse_args()
-    infer_controlnet(args.env_config_path, args.model_config_path, args.model_def_path, args.num_gpus, args.num_samples)
+    infer_controlnet(args.env_config_path, args.model_config_path, args.model_def_path, args.num_gpus, args.num_samples, args.use_pred_label)

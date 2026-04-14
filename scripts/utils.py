@@ -26,7 +26,7 @@ import monai
 from monai.bundle import ConfigParser
 from monai.config import DtypeLike, NdarrayOrTensor
 from monai.data import CacheDataset, DataLoader, partition_dataset
-from monai.transforms import Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd
+from monai.transforms import Compose, EnsureTyped, Lambdad, LoadImaged, Orientationd, GaussianSmooth
 from monai.transforms.utils_morphological_ops import dilate, erode
 from monai.utils import TransformBackends, convert_data_type, convert_to_dst_type, get_equivalent_dtype
 from scipy import stats
@@ -173,6 +173,28 @@ def dilate_one_img(mask_t: Tensor, filter_size: int | Sequence[int] = 3, pad_val
     )
 
 
+def soften_hard_mask(hard_mask: torch.Tensor, sigma: float = 0.5) -> torch.Tensor:
+    """
+    Use MONAI GaussianSmooth to convert a hard mask (0/1) to a soft mask.
+
+    Args:
+        hard_mask: Binary mask tensor, shape [1, 1, H, W, D]
+        sigma: Gaussian kernel sigma for softening
+
+    Returns:
+        Soft mask tensor, shape [1, 1, H, W, D] with values in [0, 1]
+    """
+    # hard_mask shape: [1, 1, H, W, D]
+    # GaussianSmooth expects [C, H, W, D]
+    mask_4d = hard_mask.squeeze(1)  # [1, H, W, D]
+    smooth = GaussianSmooth(sigma=sigma)
+    soft_mask = smooth(mask_4d)  # returns MetaTensor
+    soft_mask = torch.clamp(soft_mask, 0, 1)
+    # Move to same device as input
+    soft_mask = soft_mask.to(hard_mask.device)
+    return soft_mask.unsqueeze(1)  # [1, H, W, D] -> [1, 1, H, W, D]
+
+
 def binarize_labels(x: Tensor, bits: int = 8) -> Tensor:
     """
     Convert input tensor to binary representation.
@@ -315,6 +337,7 @@ def prepare_maisi_controlnet_json_dataloader(
                     d["label"] = os.path.join(data_base_dir, d["label"])
                 if "pre" in d:
                     d["pre"] = os.path.join(data_base_dir, d["pre"])
+                # pred_label is relative to project root, not data_base_dir
                 list_train.append(d)
             list_valid = []
             for d in copy.deepcopy(json_data["validation"]):
@@ -323,14 +346,15 @@ def prepare_maisi_controlnet_json_dataloader(
                     d["label"] = os.path.join(data_base_dir, d["label"])
                 if "pre" in d:
                     d["pre"] = os.path.join(data_base_dir, d["pre"])
+                # pred_label is relative to project root, not data_base_dir
                 list_valid.append(d)
         else:
             list_train, list_valid = add_data_dir2path(json_data["training"], data_base_dir, fold)
 
     common_transform = [
-        LoadImaged(keys=["image", "label", "pre"], image_only=True, ensure_channel_first=True),
-        Orientationd(keys=["label", "pre"], axcodes="RAS"),
-        EnsureTyped(keys=["label"], dtype=torch.float32, track_meta=True),
+        LoadImaged(keys=["image", "label", "pre", "pred_label"], image_only=True, ensure_channel_first=True),
+        Orientationd(keys=["label", "pre", "pred_label"], axcodes="RAS"),
+        EnsureTyped(keys=["label", "pred_label"], dtype=torch.float32, track_meta=True),
         EnsureTyped(keys=["pre"], dtype=torch.float32, track_meta=True),
         Lambdad(keys="top_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),
         Lambdad(keys="bottom_region_index", func=lambda x: torch.FloatTensor(x), allow_missing_keys=True),

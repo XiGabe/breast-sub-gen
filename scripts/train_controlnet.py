@@ -30,7 +30,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
+from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp, soften_hard_mask
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
 from .augmentation import remove_tumors
 
@@ -261,6 +261,12 @@ def train_controlnet(
         )
         logger.warning("********************")
 
+    # Parse mixed mask source parameters
+    args.use_mixed_mask_source = args.controlnet_train.get("use_mixed_mask_source", False)
+    args.gt_softening_sigma = args.controlnet_train.get("gt_softening_sigma", 1.5)
+    args.mixed_mask_ratio = args.controlnet_train.get("mixed_mask_ratio", 0.5)
+    logger.info(f"use_mixed_mask_source: {args.use_mixed_mask_source}, gt_softening_sigma: {args.gt_softening_sigma}, mixed_mask_ratio: {args.mixed_mask_ratio}")
+
 
     # initialize tensorboard writer
     if rank == 0:
@@ -367,6 +373,23 @@ def train_controlnet(
             images = batch["image"].to(device) * scale_factor
             labels = batch["label"].to(device)
             pre_tensor = batch["pre"].to(device)
+
+            # Mixed mask source: 50% GT (softened) + 50% nnUNet soft prediction
+            if args.use_mixed_mask_source:
+                pred_label = batch["pred_label"].to(device)
+                mask_source_rand = torch.rand(labels.shape[0], device=device)
+                use_nnunet_mask = mask_source_rand < args.mixed_mask_ratio
+                nnunet_count = use_nnunet_mask.sum().item()
+                gt_count = labels.shape[0] - nnunet_count
+                if rank == 0 and step % 50 == 0:
+                    logger.info(f"[Batch {step}] nnUNet masks: {nnunet_count}, GT masks: {gt_count}")
+                for i in range(labels.shape[0]):
+                    if use_nnunet_mask[i]:
+                        # Use nnUNet soft prediction (already soft)
+                        labels[i] = pred_label[i]
+                    else:
+                        # Use softened GT mask
+                        labels[i] = soften_hard_mask(labels[i:i+1], sigma=args.gt_softening_sigma).squeeze(0)
             if labels.shape[1] != 1:
                 raise ValueError(f"We expect labels with shape [B,1,X,Y,Z], yet got {labels.shape}")
             if pre_tensor.shape[1] != 1:
@@ -446,7 +469,10 @@ def train_controlnet(
                 if weighted_loss > 1.0:
                     weights = torch.ones_like(images).to(images.device)
                     roi = torch.zeros([noise_shape[0]] + [1] + noise_shape[2:]).to(images.device)
-                    interpolate_label = F.interpolate(labels.float(), size=images.shape[2:], mode="nearest")
+                    # Use original GT label (batch["label"]) for ROI mask computation
+                    # to ensure correct weighting even when mixed mask source is enabled
+                    original_labels_for_weight = batch["label"].to(device)
+                    interpolate_label = F.interpolate(original_labels_for_weight.float(), size=images.shape[2:], mode="nearest")
                     # assign larger weights for ROI (tumor)
                     for label in weighted_loss_label:
                         roi[interpolate_label == label] = 1
@@ -510,8 +536,16 @@ def train_controlnet(
             with torch.no_grad():
                 for val_step, val_batch in enumerate(val_loader):
                     val_images = val_batch["image"].to(device) * scale_factor
-                    val_labels = val_batch["label"].to(device)
+                    val_labels = val_batch["label"].to(device)  # GT for loss computation
                     val_pre_tensor = val_batch["pre"].to(device)
+
+                    # Use nnUNet prediction as ControlNet input (mimics inference scenario)
+                    val_pred_label = val_batch["pred_label"].to(device)
+                    if args.use_mixed_mask_source:
+                        # For validation, always use nnUNet prediction as ControlNet input
+                        val_controlnet_labels = val_pred_label
+                    else:
+                        val_controlnet_labels = val_labels
 
                     val_spacing_tensor = val_batch["spacing"].to(device)
                     val_modality_tensor = None
@@ -533,8 +567,9 @@ def train_controlnet(
                                 0, noise_scheduler.num_train_timesteps, (val_images.shape[0],), device=val_images.device
                             ).long()
 
+                        # Use nnUNet prediction for ControlNet input, but GT for loss
                         val_model_output, _, _ = compute_model_output(
-                            val_images, val_labels, val_pre_tensor, val_noise, val_timesteps, noise_scheduler,
+                            val_images, val_controlnet_labels, val_pre_tensor, val_noise, val_timesteps, noise_scheduler,
                             controlnet, unet,
                             val_spacing_tensor,
                             val_modality_tensor,
@@ -552,16 +587,7 @@ def train_controlnet(
                         else:
                             val_model_gt = val_noise
 
-                        if weighted_loss > 1.0:
-                            val_weights = torch.ones_like(val_images).to(val_images.device)
-                            val_roi = torch.zeros([val_images.shape[0]] + [1] + list(val_images.shape[2:])).to(val_images.device)
-                            val_interpolate_label = F.interpolate(val_labels.float(), size=val_images.shape[2:], mode="nearest")
-                            for label in weighted_loss_label:
-                                val_roi[val_interpolate_label == label] = 1
-                            val_weights[val_roi.repeat(1, val_images.shape[1], 1, 1, 1) == 1] = weighted_loss
-                            val_loss = (F.l1_loss(val_model_output.float(), val_model_gt.float(), reduction="none") * val_weights).mean()
-                        else:
-                            val_loss = F.l1_loss(val_model_output.float(), val_model_gt.float())
+                        val_loss = F.l1_loss(val_model_output.float(), val_model_gt.float())
 
                     val_loss_ += val_loss.detach()
 
